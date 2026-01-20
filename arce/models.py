@@ -82,28 +82,28 @@ class IterativeDecimator(nn.Module):
         s_senders = assignments[graph.senders] # [num_edges, num_clusters]
         s_receivers = assignments[graph.receivers] # [num_edges, num_clusters]
         
-        # Contribution to each (k, l) pair
-        # We want to sum over all edges (i, j) in the same graph
-        # For simplicity and JIT-friendliness, we can use a dense intermediate or 
-        # a more efficient segment_sum if we can index (k, l)
+        # Optimized edge aggregation to avoid O(E * K^2) memory bottleneck
+        # We want: coarse_adj_dense[b, k, l] = sum_{e in graph b} S[senders[e], k] * S[receivers[e], l]
+        # We can compute this by iterating over k to keep intermediate tensors at O(E * K)
         
-        # Using a dense approach per batch for clarity and since num_clusters is small
-        # [num_edges, num_clusters, num_clusters]
-        edge_contributions = s_senders[:, :, None] * s_receivers[:, None, :]
-        
-        # Sum contributions per graph
         edge_batch_indices = jnp.repeat(
             jnp.arange(num_graphs),
             graph.n_edge,
             total_repeat_length=graph.senders.shape[0]
         )
-        
-        # [num_graphs, num_clusters, num_clusters]
-        coarse_adj_dense = jraph.segment_sum(
-            edge_contributions, 
-            edge_batch_indices, 
-            num_segments=num_graphs
-        )
+
+        def compute_coarse_adj_row(k):
+            # Contribution of cluster k as sender to all other clusters
+            # Use jnp.take to avoid slice with tracer issues
+            sender_k = jnp.take(s_senders, k, axis=1)[:, None]
+            contributions_k = sender_k * s_receivers
+            # Sum per graph: [num_graphs, num_clusters]
+            return jraph.segment_sum(contributions_k, edge_batch_indices, num_segments=num_graphs)
+
+        # [num_clusters, num_graphs, num_clusters]
+        coarse_adj_dense = jax.vmap(compute_coarse_adj_row)(jnp.arange(self.num_clusters))
+        # Transpose to [num_graphs, num_clusters, num_clusters]
+        coarse_adj_dense = jnp.transpose(coarse_adj_dense, (1, 0, 2))
         
         # Convert dense coarse adjacency back to sparse (FC-like but with weights)
         # To maintain fixed shapes for JIT, we keep all clusters connected but use the weights

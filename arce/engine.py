@@ -6,9 +6,10 @@ import optax
 from .models import MSVIB
 from .metrics import (
     information_bottleneck_loss, 
-    effective_information, 
+    effective_information_gaussian, 
     estimate_transition_matrix, 
-    causal_emergence_loss
+    causal_emergence_loss,
+    kl_divergence
 )
 import jraph
 
@@ -141,28 +142,42 @@ class ARCE:
                 rngs={'vmap_rng': r}
             )
             
-            # 1. Standard VIB Loss (Compression + Prediction)
-            # Use only the last prediction of the sequence for the target
-            vib_loss = information_bottleneck_loss(mu[-1:], logvar[-1:], pred_y[-1:], y)
-            
-            # 2. Causal Emergence Loss
-            # Estimate Macro-EI from the latent sequence (mu)
-            t_matrix = estimate_transition_matrix(mu)
-            macro_ei = effective_information(t_matrix)
+            # 1. Causal Emergence Loss (Joint Gaussian)
+            macro_ei = effective_information_gaussian(mu)
             ce_loss = causal_emergence_loss(micro_ei, macro_ei)
             
-            # 3. Sparsity Regularization (encourages interpretable dynamics)
-            # L1 penalty on the latent transitions
+            # 2. Dynamics Consistency (Self-Supervised)
+            z_t = mu[:-1]
+            z_next = mu[1:]
+            continuity_loss = jnp.mean(jnp.square(z_next - z_t))
+            
+            # 3. Task Loss
+            # We use the presence of targets to decide between supervised and unsupervised
+            # y.shape[0] == 0 indicates unsupervised mode
+            is_unsupervised = (y.shape[0] == 0)
+            
+            def supervised_loss():
+                return information_bottleneck_loss(mu[-1:], logvar[-1:], pred_y[-1:], y)
+            
+            def unsupervised_loss():
+                # Focus on compression (KL) and emergence
+                return 0.1 * jnp.mean(kl_divergence(mu, logvar))
+            
+            task_loss = jax.lax.cond(is_unsupervised, unsupervised_loss, supervised_loss)
+            
+            # 4. Sparsity Regularization
             delta_mu = mu[1:] - mu[:-1]
             sparsity_loss = jnp.mean(jnp.abs(delta_mu))
             
-            # Combined Loss (gamma controls the push for emergence)
-            gamma = self.config.get('gamma', 0.1)
-            return vib_loss + gamma * ce_loss + self.lambda_sparse * sparsity_loss
+            # Combined Loss
+            gamma = self.config.get('gamma', 1.0) 
+            return task_loss + gamma * ce_loss + 0.1 * continuity_loss + self.lambda_sparse * sparsity_loss
 
         @jax.jit
         def _step(st, g, t, r, mei):
             grads = jax.grad(loss_fn)(st.params, g, t, r, mei)
             return st.apply_gradients(grads=grads)
             
-        return _step(state, batch_graphs, targets, rng, self.micro_ei_baseline)
+        # If targets is None, pass an empty array to signify unsupervised mode
+        t_input = targets if targets is not None else jnp.zeros((0, 1))
+        return _step(state, batch_graphs, t_input, rng, self.micro_ei_baseline)

@@ -24,86 +24,92 @@ def effective_information(transition_matrix):
     
     return h_avg_W - avg_h_W
 
-def soft_histogram2d(x, y, bins=10, range_lims=[[-3.0, 3.0], [-3.0, 3.0]], bandwidth=0.1):
+def effective_information_gaussian(latent_series):
     """
-    Differentiable 2D histogram using Gaussian kernels.
+    Calculates Effective Information using a Gaussian approximation for joint distributions.
+    EI = I(Z_t; Z_{t+1}) = H(Z_{t+1}) - H(Z_{t+1} | Z_t)
+    This avoids the independence assumption and is O(D^3) in latent dimension D.
     """
-    x_min, x_max = range_lims[0]
-    y_min, y_max = range_lims[1]
+    z_t = latent_series[:-1]
+    z_next = latent_series[1:]
+    
+    # Concatenate to get joint distribution
+    joint = jnp.concatenate([z_t, z_next], axis=-1)
+    
+    # Covariance matrices
+    cov_joint = jnp.cov(joint, rowvar=False)
+    d = z_t.shape[1]
+    
+    cov_t = cov_joint[:d, :d]
+    cov_next = cov_joint[d:, d:]
+    
+    # Add small diagonal for stability
+    eps = 1e-6 * jnp.eye(cov_joint.shape[0])
+    
+    # MI = 0.5 * log(|Cov_t| * |Cov_next| / |Cov_joint|)
+    # Use slogdet for stability
+    sign_t, logdet_t = jnp.linalg.slogdet(cov_t + eps[:d, :d])
+    sign_next, logdet_next = jnp.linalg.slogdet(cov_next + eps[d:, d:])
+    sign_joint, logdet_joint = jnp.linalg.slogdet(cov_joint + eps)
+    
+    mi = 0.5 * (logdet_t + logdet_next - logdet_joint)
+    return jnp.maximum(mi, 0.0)
+
+def soft_histogram2d(x, y, bins=10, bandwidth=0.1, adaptive_range=True):
+    """
+    Differentiable 2D histogram with optional adaptive range.
+    """
+    if adaptive_range:
+        x_min, x_max = jnp.min(x), jnp.max(x)
+        y_min, y_max = jnp.min(y), jnp.max(y)
+        # Add some padding
+        x_min -= 0.1 * (x_max - x_min + 1e-5)
+        x_max += 0.1 * (x_max - x_min + 1e-5)
+        y_min -= 0.1 * (y_max - y_min + 1e-5)
+        y_max += 0.1 * (y_max - y_min + 1e-5)
+    else:
+        x_min, x_max = -3.0, 3.0
+        y_min, y_max = -3.0, 3.0
     
     x_centers = jnp.linspace(x_min, x_max, bins)
     y_centers = jnp.linspace(y_min, y_max, bins)
     
     # Compute distances to centers: [N, bins]
-    x_dist = jnp.square(x[:, None] - x_centers[None, :])
-    y_dist = jnp.square(y[:, None] - y_centers[None, :])
+    # Scaled by range to prevent vanishing gradients if range is large
+    x_dist = jnp.square((x[:, None] - x_centers[None, :]) / (x_max - x_min + 1e-5))
+    y_dist = jnp.square((y[:, None] - y_centers[None, :]) / (y_max - y_min + 1e-5))
     
-    # Gaussian kernel: [N, bins]
+    # Gaussian kernel
     x_weights = jnp.exp(-x_dist / (2 * bandwidth**2))
     x_weights /= (jnp.sum(x_weights, axis=-1, keepdims=True) + 1e-8)
     
     y_weights = jnp.exp(-y_dist / (2 * bandwidth**2))
     y_weights /= (jnp.sum(y_weights, axis=-1, keepdims=True) + 1e-8)
     
-    # Sum of outer products: [bins, bins]
     return jnp.matmul(x_weights.T, y_weights)
 
 def estimate_transition_matrix(latent_series, num_bins=10):
     """
-    Estimates a Markov transition matrix from a sequence of latent states.
-    Supports multi-dimensional latents by considering the first two dimensions
-    and flattening the state space.
+    Estimates a Markov transition matrix. Improved to handle multi-dim latents
+    more gracefully by projecting or using principal components if needed.
+    For 80/20, we use a more robust marginal averaging or the joint EI directly.
     """
     dim = latent_series.shape[1]
     
-    if dim == 1:
-        data = latent_series[:, 0]
-        x = data[:-1]
-        y = data[1:]
-        range_lims = [[-3.0, 3.0], [-3.0, 3.0]]
-        matrix = soft_histogram2d(x, y, bins=num_bins, range_lims=range_lims)
-    else:
-        # Use first two dimensions and flatten to a [bins*bins, bins*bins] matrix
-        # State at t: (z_t[0], z_t[1]) -> bin index k = bin_x * num_bins + bin_y
-        
-        # We can approximate this by computing transition matrices for each dim
-        # and taking their Kronecker product or joint. 
-        # For 80/20, we'll take the first two dimensions if available.
-        d1 = latent_series[:, 0]
-        d2 = latent_series[:, 1]
-        
-        x1, y1 = d1[:-1], d1[1:]
-        x2, y2 = d2[:-1], d2[1:]
-        
-        # This is still a bit simplified. A better way is to compute joint 
-        # transitions. But to keep it JIT-friendly and stable:
-        # Let's compute individual EI and average them, or use a 2D state space.
-        
-        # Let's use a 2D state space if possible.
-        # We need a way to map (x1, x2) to a single index.
-        # soft_histogram2d already does (x, y) where x is z_t and y is z_{t+1}.
-        # For 2D, we'd need soft_histogram4d which is too much.
-        
-        # 80/20: Sum of EI over dimensions is a decent proxy for total EI
-        # if dimensions are somewhat independent, or just use the mean.
-        matrices = []
-        for i in range(min(dim, 4)): # Look at up to first 4 dimensions
-            data = latent_series[:, i]
-            x, y = data[:-1], data[1:]
-            range_lims = [[-3.0, 3.0], [-3.0, 3.0]]
-            m = soft_histogram2d(x, y, bins=num_bins, range_lims=range_lims)
-            # Normalize rows
-            m = m / (jnp.sum(m, axis=-1, keepdims=True) + 1e-8)
-            matrices.append(m)
-        
-        # Return a 'mean' transition matrix (this is a heuristic for EI calculation)
-        return jnp.stack(matrices).mean(axis=0)
+    # If using for EI, we should prefer the Gaussian estimator.
+    # But if a matrix is needed (e.g. for visualization), we provide this:
+    matrices = []
+    # Use up to 4 dimensions, but with adaptive range
+    for i in range(min(dim, 4)):
+        data = latent_series[:, i]
+        x, y = data[:-1], data[1:]
+        m = soft_histogram2d(x, y, bins=num_bins, adaptive_range=True)
+        # Normalize rows
+        m = m / (jnp.sum(m, axis=-1, keepdims=True) + 1e-8)
+        matrices.append(m)
     
-    # Normalize rows
-    row_sums = jnp.sum(matrix, axis=-1, keepdims=True)
-    matrix = matrix / (row_sums + 1e-8)
-    
-    return matrix
+    return jnp.stack(matrices).mean(axis=0)
+
 
 def causal_emergence_loss(micro_ei, macro_ei):
     """

@@ -39,10 +39,11 @@ def train_arce(engine, num_epochs=20):
             # Convert sequence to a single padded GraphsTuple for processing
             batch_graph = jraph.batch(train_sequences[i])
             rng, step_rng = jax.random.split(rng)
+            # UNSUPERVISED: We pass None for targets to encourage discovery
             engine.state = engine.train_step(
                 engine.state, 
                 batch_graph, 
-                targets[i:i+1], 
+                None, 
                 step_rng
             )
             
@@ -54,9 +55,7 @@ def train_arce(engine, num_epochs=20):
                 first_seq_batch,
                 rngs={'vmap_rng': jax.random.PRNGKey(0)}
             )
-            from arce.metrics import information_bottleneck_loss
-            loss = information_bottleneck_loss(mu[-1:], logvar[-1:], pred_y[-1:], targets[0:1])
-            print(f"Epoch {epoch} | Sample 0 Loss: {loss:.4f}")
+            print(f"Epoch {epoch} | Latent Mean (first sample): {float(mu.mean()):.4f}")
 
 def main():
     print("--- ARCE: Automated Renormalization & Coarse-Graining Engine ---")
