@@ -152,19 +152,23 @@ def estimate_transition_matrix(latent_series, num_bins=12):
     return jnp.stack(matrices).mean(axis=0)
 
 
-def causal_emergence_loss(micro_ei, macro_ei, macro_entropy_weight=0.1):
+def causal_emergence_loss(micro_ei, macro_ei, mi_micro_macro, target_mi=1.0):
     """
     Loss to maximize Causal Emergence.
-    Includes a 'Grounding' term: we want macro_ei > micro_ei, but we also
-    want the macro-state to have sufficient entropy (avoiding collapse to trivial states).
+    Includes a Mutual Information (MI) constraint between micro and macro levels
+    to prevent "hallucinated emergence" where the model ignores the micro-state variance.
     """
+    # Maximize (macro_ei - micro_ei) -> Minimize (micro_ei - macro_ei)
     ce = jax.nn.relu(micro_ei - macro_ei)
     
-    # Penalty for too low macro-EI or collapsed entropy
-    # This addresses the 'Causal Emergence Paradox' by preventing trivial solutions.
+    # MI constraint: Ensure the macro-state captures sufficient information from micro-state
+    # This prevents the model from collapsing into a trivial deterministic state.
+    mi_penalty = jax.nn.relu(target_mi - mi_micro_macro)
+    
+    # Grounding: ensure macro_ei doesn't drop to zero
     grounding_penalty = jax.nn.relu(0.5 - macro_ei) 
     
-    return ce + 0.1 * grounding_penalty
+    return ce + 0.5 * mi_penalty + 0.1 * grounding_penalty
 
 def information_bottleneck_loss(mu, logvar, pred_y, target_y, beta=1e-3):
     """

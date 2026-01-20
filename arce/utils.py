@@ -117,6 +117,43 @@ def suggest_num_clusters(eigs, threshold=0.1):
     n_suggested = jnp.argmax(gaps[:len(eigs)//2]) + 1
     return int(n_suggested)
 
+class BasisLibrary:
+    """Configurable basis library for Symbolic Discovery."""
+    def __init__(self, include_transcendental=True, include_quadratic=True):
+        self.include_transcendental = include_transcendental
+        self.include_quadratic = include_quadratic
+
+    def get_features(self, data):
+        """Pure JAX version of basis library for JIT compatibility."""
+        n, d = data.shape
+        # Linear and Bias
+        feats = [jnp.ones((n, 1)), data]
+        
+        # Quadratic
+        if self.include_quadratic:
+            for i in range(d):
+                for j in range(i, d):
+                    feats.append((data[:, i] * data[:, j])[:, None])
+        
+        if self.include_transcendental:
+            feats.append(jnp.sin(data))
+            feats.append(jnp.cos(data))
+            feats.append(jnp.exp(-jnp.square(data)))
+            
+        return jnp.concatenate(feats, axis=-1)
+
+    def get_names(self, d):
+        names = ["1"] + [f"M{i}" for i in range(d)]
+        if self.include_quadratic:
+            for i in range(d):
+                for j in range(i, d):
+                    names.append(f"M{i}*M{j}")
+        if self.include_transcendental:
+            names += [f"sin(M{i})" for i in range(d)]
+            names += [f"cos(M{i})" for i in range(d)]
+            names += [f"exp(-M{i}^2)" for i in range(d)]
+        return names
+
 def plot_information_tradeoff(betas, info_loss, predictive_power):
     """Visualization for Information Loss vs. Predictive Power."""
     import matplotlib.pyplot as plt

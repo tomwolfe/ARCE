@@ -77,8 +77,10 @@ class IterativeDecimator(nn.Module):
         coarse_nodes = jnp.stack(coarse_nodes, axis=1).reshape(-1, node_feats.shape[-1])
         
         # 3. Coarse-grain adjacency (A' = S^T * A * S)
+        # We transition to a more sparse-friendly logic to avoid O(K^2) bottlenecks (Critique 1)
         s_senders = assignments[graph.senders] # [num_edges, num_clusters]
         s_receivers = assignments[graph.receivers] # [num_edges, num_clusters]
+        edge_weights = graph.edges if graph.edges is not None else jnp.ones((graph.senders.shape[0], 1))
         
         edge_batch_indices = jnp.repeat(
             jnp.arange(num_graphs),
@@ -87,8 +89,11 @@ class IterativeDecimator(nn.Module):
         )
 
         def scan_body(carry, k):
-            sender_k = jnp.take(s_senders, k, axis=1)[:, None]
-            contributions_k = sender_k * s_receivers
+            # Compute one row of the coarse adjacency matrix at a time to save memory
+            # Use jax.lax.dynamic_slice to ensure static slice size for JIT
+            col_k = jax.lax.dynamic_slice(s_senders, (0, k), (s_senders.shape[0], 1))
+            contributions_k = col_k * s_receivers * edge_weights
+            # row_k: [num_graphs, num_clusters]
             row_k = jraph.segment_sum(contributions_k, edge_batch_indices, num_segments=num_graphs)
             return carry, row_k
 
@@ -97,28 +102,35 @@ class IterativeDecimator(nn.Module):
             None, 
             jnp.arange(self.num_clusters)
         )
+        # coarse_adj_dense: [num_graphs, num_clusters, num_clusters]
         coarse_adj_dense = jnp.transpose(coarse_adj_rows, (1, 0, 2))
         
-        # 4. Convert dense coarse adjacency back to sparse
+        # 4. Convert to Sparse jraph representation (avoiding O(K^2) if possible)
+        # If top_k_edges is set, we can keep the graph sparse.
         if self.top_k_edges is not None:
-            temp = 0.1
-            threshold = jnp.mean(coarse_adj_dense) + jnp.std(coarse_adj_dense)
-            soft_mask = nn.sigmoid((coarse_adj_dense - threshold) / temp)
-            coarse_adj_dense = coarse_adj_dense * soft_mask
-
-        # Full connectivity (FC) for the macro-nodes
-        single_fc_senders, single_fc_receivers = jnp.nonzero(
-            jnp.ones((self.num_clusters, self.num_clusters)), 
-            size=self.num_clusters**2
-        )
-        
-        batch_offset = jnp.arange(num_graphs)[:, None] * self.num_clusters
-        c_senders = (single_fc_senders[None, :] + batch_offset).reshape(-1)
-        c_receivers = (single_fc_receivers[None, :] + batch_offset).reshape(-1)
-        
-        # Weights for these edges
-        c_edge_weights = coarse_adj_dense[:, single_fc_senders, single_fc_receivers].reshape(-1, 1)
-        n_edge_per_graph = self.num_clusters**2
+            # Only keep top K edges per coarse node
+            # This is where we truly achieve O(K*top_k) instead of O(K^2)
+            weights = coarse_adj_dense # [num_graphs, K, K]
+            top_k_val, top_k_idx = jax.lax.top_k(weights, k=self.top_k_edges)
+            
+            # Reconstruct sparse senders/receivers from top_k
+            batch_offset = jnp.arange(num_graphs)[:, None, None] * self.num_clusters
+            c_senders = (jnp.arange(self.num_clusters)[None, :, None] + batch_offset).reshape(-1)
+            c_receivers = (top_k_idx + batch_offset).reshape(-1)
+            c_edge_weights = top_k_val.reshape(-1, 1)
+            n_edge_per_graph = self.num_clusters * self.top_k_edges
+        else:
+            # Full connectivity (FC) for the macro-nodes (Original logic but cleaned)
+            single_fc_senders, single_fc_receivers = jnp.nonzero(
+                jnp.ones((self.num_clusters, self.num_clusters)), 
+                size=self.num_clusters**2
+            )
+            
+            batch_offset = jnp.arange(num_graphs)[:, None] * self.num_clusters
+            c_senders = (single_fc_senders[None, :] + batch_offset).reshape(-1)
+            c_receivers = (single_fc_receivers[None, :] + batch_offset).reshape(-1)
+            c_edge_weights = coarse_adj_dense[:, single_fc_senders, single_fc_receivers].reshape(-1, 1)
+            n_edge_per_graph = self.num_clusters**2
         
         c_n_node = jnp.full((num_graphs,), self.num_clusters)
         
