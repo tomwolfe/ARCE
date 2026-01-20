@@ -17,18 +17,20 @@ def train_arce(engine, num_epochs=20):
     for T in [1.5, 2.26, 3.5]:
         for _ in range(2): # 2 sequences per temperature
             seq = []
-            spins = generate_ising_2d(L=8, T=T, steps=100)
+            rng, subkey = jax.random.split(rng)
+            spins = generate_ising_2d(L=8, T=T, steps=100, key=subkey)
             for _ in range(5): # Sequence length 5
                 graph = ising_to_jraph(spins)
                 seq.append(graph)
                 
                 # Evolve system
-                spins = generate_ising_2d(L=8, T=T, steps=10)
+                rng, subkey = jax.random.split(rng)
+                spins = generate_ising_2d(L=8, T=T, steps=10, key=subkey)
                 
             train_sequences.append(seq)
             # Target for the LAST state in sequence is its magnetization 
             # (or we could predict next magnetization for each step)
-            targets.append(np.abs(np.mean(spins)))
+            targets.append(jnp.abs(jnp.mean(spins)))
             
     targets = jnp.array(targets).reshape(-1, 1)
     
@@ -75,7 +77,8 @@ def main():
     rng = jax.random.PRNGKey(42)
     
     # Generate a sample graph to initialize params
-    sample_spins = generate_ising_2d(L=6, T=2.26)
+    rng, subkey = jax.random.split(rng)
+    sample_spins = generate_ising_2d(L=6, T=2.26, key=subkey)
     sample_graph = ising_to_jraph(sample_spins)
     engine.init_model(rng, sample_graph)
     
@@ -88,18 +91,27 @@ def main():
     print("\n--- Demonstration: Coarsening ---")
     temps = [1.0, 2.26, 4.0] 
     for T in temps:
-        spins = generate_ising_2d(L=6, T=T)
+        rng, subkey = jax.random.split(rng)
+        spins = generate_ising_2d(L=6, T=T, key=subkey)
         graph = ising_to_jraph(spins)
         
         rng, subkey = jax.random.split(rng)
         coarse_graph, mu = engine.coarsen(graph, rng=subkey)
         
-        magnetization = np.abs(np.mean(spins))
+        magnetization = jnp.abs(jnp.mean(spins))
         print(f"Temp: {T:.2f} | Micro-Magnetization: {magnetization:.4f} | Macro-Latent Mean: {mu.mean():.4f}")
 
     # 5. Symbolic Discovery
     print("\n--- Demonstration: Symbolic Discovery ---")
-    history = [ising_to_jraph(generate_ising_2d(L=10, T=2.26)) for _ in range(10)]
+    # Address "Small Sample Size" critique: use 50 steps instead of 10
+    history = []
+    rng, subkey = jax.random.split(rng)
+    curr_spins = generate_ising_2d(L=10, T=2.26, steps=500, key=subkey)
+    for _ in range(50):
+        history.append(ising_to_jraph(curr_spins))
+        rng, subkey = jax.random.split(rng)
+        curr_spins = generate_ising_2d(L=10, T=2.26, steps=20, key=subkey)
+        
     equation = engine.discover_dynamics(history)
     print(f"Discovered Equation: {equation}")
 

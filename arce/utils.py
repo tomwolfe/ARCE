@@ -1,25 +1,50 @@
-import numpy as np
+import jax
 import jax.numpy as jnp
 import jraph
 import networkx as nx
 
-def generate_ising_2d(L=10, T=2.26, steps=1000):
+def generate_ising_2d(L=10, T=2.26, steps=1000, key=None):
     """
-    Generates 2D Ising model configurations using Metropolis algorithm.
-    T_c approx 2.269
+    Generates 2D Ising model configurations using JAX-native Metropolis algorithm.
+    Uses checkerboard updates for parallelism.
     """
-    spins = np.random.choice([-1, 1], size=(L, L))
+    if key is None:
+        key = jax.random.PRNGKey(42)
     
-    for _ in range(steps):
-        i, j = np.random.randint(0, L, size=2)
-        # Periodic boundary conditions
-        delta_E = 2 * spins[i, j] * (
-            spins[(i+1)%L, j] + spins[(i-1)%L, j] +
-            spins[i, (j+1)%L] + spins[i, (j-1)%L]
-        )
-        if delta_E <= 0 or np.random.rand() < np.exp(-delta_E / T):
-            spins[i, j] *= -1
+    key, subkey = jax.random.split(key)
+    spins = jax.random.choice(subkey, jnp.array([-1, 1]), shape=(L, L))
+    
+    # Precompute indices for checkerboard
+    indices = jnp.indices((L, L))
+    checkerboard = (indices[0] + indices[1]) % 2
+    
+    def step_fn(spins, key):
+        # One update for each color of the checkerboard
+        for color in [0, 1]:
+            key, subkey = jax.random.split(key)
             
+            # Neighbors (periodic boundary conditions)
+            up = jnp.roll(spins, shift=1, axis=0)
+            down = jnp.roll(spins, shift=-1, axis=0)
+            left = jnp.roll(spins, shift=1, axis=1)
+            right = jnp.roll(spins, shift=-1, axis=1)
+            
+            delta_E = 2 * spins * (up + down + left + right)
+            
+            # Metropolis criterion
+            p_accept = jnp.exp(-delta_E / T)
+            accept = jax.random.uniform(subkey, shape=(L, L)) < p_accept
+            
+            # Only update the current color
+            mask = (checkerboard == color)
+            spins = jnp.where(mask & ( (delta_E <= 0) | accept ), -spins, spins)
+            
+        return spins, None
+
+    # Run steps
+    keys = jax.random.split(key, steps)
+    spins, _ = jax.lax.scan(step_fn, spins, keys)
+    
     return spins
 
 def ising_to_jraph(spins):
@@ -28,7 +53,7 @@ def ising_to_jraph(spins):
     num_nodes = L * L
     
     # Nodes are spins (flattened)
-    nodes = spins.flatten().reshape(-1, 1).astype(np.float32)
+    nodes = spins.flatten().reshape(-1, 1).astype(jnp.float32)
     
     # Grid edges (4-connectivity)
     senders = []
