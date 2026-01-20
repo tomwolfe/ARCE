@@ -65,7 +65,7 @@ def main():
     config = {
         'encoder_features': [16, 8], # Smaller networks for demo
         'latent_dim': 2,
-        'num_clusters': 4,
+        'num_clusters_list': [8, 4], # Hierarchical pooling: 64 -> 8 -> 4 nodes
         'lr': 1e-3
     }
     

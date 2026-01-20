@@ -24,10 +24,34 @@ def effective_information(transition_matrix):
     
     return h_avg_W - avg_h_W
 
+def soft_histogram2d(x, y, bins=10, range_lims=[[-3.0, 3.0], [-3.0, 3.0]], bandwidth=0.1):
+    """
+    Differentiable 2D histogram using Gaussian kernels.
+    """
+    x_min, x_max = range_lims[0]
+    y_min, y_max = range_lims[1]
+    
+    x_centers = jnp.linspace(x_min, x_max, bins)
+    y_centers = jnp.linspace(y_min, y_max, bins)
+    
+    # Compute distances to centers: [N, bins]
+    x_dist = jnp.square(x[:, None] - x_centers[None, :])
+    y_dist = jnp.square(y[:, None] - y_centers[None, :])
+    
+    # Gaussian kernel: [N, bins]
+    x_weights = jnp.exp(-x_dist / (2 * bandwidth**2))
+    x_weights /= (jnp.sum(x_weights, axis=-1, keepdims=True) + 1e-8)
+    
+    y_weights = jnp.exp(-y_dist / (2 * bandwidth**2))
+    y_weights /= (jnp.sum(y_weights, axis=-1, keepdims=True) + 1e-8)
+    
+    # Sum of outer products: [bins, bins]
+    return jnp.matmul(x_weights.T, y_weights)
+
 def estimate_transition_matrix(latent_series, num_bins=10):
     """
     Estimates a Markov transition matrix from a sequence of latent states.
-    Uses vectorized operations for JAX compatibility.
+    Uses differentiable soft-binning for JAX gradient compatibility.
     """
     # Use only the first dimension for state estimation as in the original
     data = latent_series[:, 0]
@@ -38,7 +62,7 @@ def estimate_transition_matrix(latent_series, num_bins=10):
     
     # Use fixed range for JIT compatibility
     range_lims = [[-3.0, 3.0], [-3.0, 3.0]]
-    matrix, _, _ = jnp.histogram2d(x, y, bins=num_bins, range=range_lims)
+    matrix = soft_histogram2d(x, y, bins=num_bins, range_lims=range_lims)
     
     # Normalize rows
     row_sums = jnp.sum(matrix, axis=-1, keepdims=True)

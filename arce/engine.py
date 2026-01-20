@@ -18,7 +18,7 @@ class ARCE:
         self.model = MSVIB(
             encoder_features=config.get('encoder_features', [64, 64]),
             latent_dim=config.get('latent_dim', 16),
-            num_clusters=config.get('num_clusters', 4)
+            num_clusters_list=config.get('num_clusters_list', [4])
         )
         self.params = None
         self.state = None
@@ -48,44 +48,64 @@ class ARCE:
     def discover_dynamics(self, time_series_graphs):
         """
         Identifies sparse dynamics in the coarse-grained latent space.
-        Uses Lasso (L1 regularization) to find a sparse basis function representation.
+        Uses JAX-native ISTA (Lasso) for end-to-end differentiability and speed.
         """
-        from sklearn.linear_model import Lasso
-        from sklearn.preprocessing import PolynomialFeatures
+        print("ARCE: Identifying Sufficient Statistics (JAX-native)...")
         
-        print("ARCE: Identifying Sufficient Statistics...")
         # 1. Extract macro-states over time
+        # We use a JITted function to extract all at once if possible
         macro_states = []
         for g in time_series_graphs:
             _, mu = self.coarsen(g)
             macro_states.append(mu)
         
-        # Ensure macro_states is 2D (time, latent_dim)
-        macro_states = np.array(jnp.concatenate(macro_states, axis=0))
+        macro_states = jnp.concatenate(macro_states, axis=0) # [time, latent_dim]
         
         # 2. Prepare data for Symbolic Regression (X, y)
         X = macro_states[:-1]
         y = macro_states[1:] - macro_states[:-1]
         
-        # 3. Augment features with polynomials
-        poly = PolynomialFeatures(degree=2, include_bias=True)
-        X_poly = poly.fit_transform(X)
-        feature_names = poly.get_feature_names_out([f"M{i}" for i in range(X.shape[1])])
+        # 3. JAX-native Polynomial Features (Degree 2)
+        def get_poly_features(data):
+            n, d = data.shape
+            feats = [jnp.ones((n, 1)), data]
+            for i in range(d):
+                for j in range(i, d):
+                    feats.append((data[:, i] * data[:, j])[:, None])
+            return jnp.concatenate(feats, axis=-1)
+            
+        X_poly = get_poly_features(X)
         
-        # 4. Sparse Regression
-        lasso = Lasso(alpha=0.01)
-        lasso.fit(X_poly, y)
+        # Feature names for reconstruction
+        d = X.shape[1]
+        names = ["1"] + [f"M{i}" for i in range(d)]
+        for i in range(d):
+            for j in range(i, d):
+                names.append(f"M{i}*M{j}")
+
+        # 4. JAX-native Sparse Regression (ISTA)
+        def soft_threshold(x, thresh):
+            return jnp.sign(x) * jnp.maximum(jnp.abs(x) - thresh, 0)
+
+        def lasso_ista(X_mat, y_mat, alpha=0.01, num_iters=500):
+            n_feat = X_mat.shape[1]
+            n_target = y_mat.shape[1]
+            # Conservative step size
+            step = 0.5 / (jnp.linalg.norm(X_mat, ord=2)**2 + 1e-5)
+            
+            def body(i, w):
+                grad = X_mat.T @ (X_mat @ w - y_mat)
+                return soft_threshold(w - step * grad, alpha * step)
+                
+            return jax.lax.fori_loop(0, num_iters, body, jnp.zeros((n_feat, n_target)))
+
+        coeffs = lasso_ista(X_poly, y, alpha=0.01)
         
         # 5. Format the discovered equation
         equations = []
         for i in range(y.shape[1]):
-            # lasso.coef_ is (n_targets, n_features) for multi-output
-            if y.shape[1] > 1:
-                coeffs = lasso.coef_[i]
-            else:
-                coeffs = lasso.coef_
-                
-            terms = [f"{c:.3f}*{name}" for c, name in zip(coeffs, feature_names) if abs(c) > 1e-4]
+            c_target = coeffs[:, i]
+            terms = [f"{float(c):.3f}*{name}" for c, name in zip(c_target, names) if abs(c) > 1e-4]
             eq = " + ".join(terms) if terms else "0"
             equations.append(f"dM{i}/dt = {eq}")
             

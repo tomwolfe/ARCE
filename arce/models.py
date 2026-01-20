@@ -35,69 +35,103 @@ class IterativeDecimator(nn.Module):
     """
     Learnable pooling layer for renormalization (Rs operator).
     Performs soft-clustering of nodes and contracts edges.
+    Enhanced to handle batched GraphsTuple.
     """
-    latent_dim: int
     num_clusters: int
 
     @nn.compact
     def __call__(self, graph: jraph.GraphsTuple) -> Tuple[jraph.GraphsTuple, jnp.ndarray]:
-        # graph.nodes shape: [num_nodes, node_feat]
         node_feats = graph.nodes
         num_nodes = node_feats.shape[0]
+        num_graphs = graph.n_node.shape[0]
         
-        # Predict cluster assignment probabilities (Soft assignment)
+        # 1. Predict cluster assignment probabilities
+        # We want to assign each node to one of 'num_clusters' in its graph.
         assignment_logits = MLP([32, self.num_clusters])(node_feats)
         assignments = nn.softmax(assignment_logits, axis=-1) # [num_nodes, num_clusters]
         
-        # 1. Coarse-grain node features: H_macro = S^T * H_micro
-        coarse_nodes = jnp.matmul(assignments.T, node_feats) # [num_clusters, node_feat]
+        # 2. Coarse-grain node features
+        # Create a block-diagonal assignment matrix for the batch
+        batch_indices = jnp.repeat(
+            jnp.arange(num_graphs), 
+            graph.n_node, 
+            total_repeat_length=num_nodes
+        )
         
-        # 2. Coarse-grain adjacency matrix (Edge Contraction): A_macro = S^T * A_micro * S
-        # Compute sparsely: A_macro_{kl} = \sum_{ij} S_{ik} * A_{ij} * S_{jl}
-        # For each edge (i, j) with weight w, we add w * S_i.T @ S_j to the coarse adjacency
+        # H_macro = S^T * H_micro (per graph)
+        # We can use segment_sum to perform the contraction per graph
+        # For each cluster k in graph b, H_macro[b, k] = sum_{i in graph b} S[i, k] * H_micro[i]
+        coarse_nodes = []
+        for k in range(self.num_clusters):
+            weighted_nodes = node_feats * assignments[:, k:k+1]
+            coarse_nodes_k = jraph.segment_sum(weighted_nodes, batch_indices, num_segments=num_graphs)
+            coarse_nodes.append(coarse_nodes_k)
         
-        # Get assignment vectors for senders and receivers
-        s_senders = assignments[graph.senders]    # [num_edges, num_clusters]
-        s_receivers = assignments[graph.receivers] # [num_edges, num_clusters]
+        # Stack to get [num_graphs, num_clusters, node_feat] and reshape to [num_graphs * num_clusters, node_feat]
+        coarse_nodes = jnp.stack(coarse_nodes, axis=1).reshape(-1, node_feats.shape[-1])
         
-        # Weighted contraction if edges have features, otherwise assume 1.0
-        edge_weights = graph.edges if graph.edges is not None else jnp.ones((graph.senders.shape[0], 1))
+        # 3. Coarse-grain adjacency (Simplified for batching)
+        # In a real RG, we'd contract edges. For 80/20, we'll use a dense-to-sparse 
+        # approach per graph or maintain a fully connected coarse graph for simplicity.
+        # Here we'll just return the coarse nodes; the next layer can be a MLP or another GNN.
+        # For a full GNN, we'd need to reconstruct the edges.
         
-        # A_macro = (S_senders * weights).T @ S_receivers
-        coarse_adj = jnp.matmul((s_senders * edge_weights).T, s_receivers) # [num_clusters, num_clusters]
+        # Reconstruct edges: for each graph, we'll assume a fully connected coarse graph for now
+        # (This is standard in many set-pooling or graph-pooling architectures)
+        c_n_node = jnp.full((num_graphs,), self.num_clusters)
         
-        # Extract new edges from coarse_adj
-        # We maintain static shapes for JIT by using a fixed number of potential edges
-        c_senders, c_receivers = jnp.nonzero(coarse_adj, size=self.num_clusters**2)
-        c_edges = coarse_adj[c_senders, c_receivers][:, jnp.newaxis]
+        # Create fully connected edges for each coarse graph
+        def get_fc_edges(n):
+            adj = jnp.ones((n, n))
+            return jnp.nonzero(adj)
         
-        # Return coarse graph and assignment matrix
+        # For simplicity in batching, we'll return a graph with nodes only or FC edges
+        # To keep it JIT-friendly, we use a fixed size
+        single_fc_senders, single_fc_receivers = jnp.nonzero(
+            jnp.ones((self.num_clusters, self.num_clusters)), 
+            size=self.num_clusters**2
+        )
+        
+        # Repeat for all graphs in batch
+        batch_offset = jnp.arange(num_graphs)[:, None] * self.num_clusters
+        c_senders = (single_fc_senders[None, :] + batch_offset).reshape(-1)
+        c_receivers = (single_fc_receivers[None, :] + batch_offset).reshape(-1)
+        
         coarse_graph = graph._replace(
             nodes=coarse_nodes,
-            n_node=jnp.array([self.num_clusters]),
+            n_node=c_n_node,
             senders=c_senders,
             receivers=c_receivers,
-            edges=c_edges,
-            n_edge=jnp.array([len(c_senders)])
+            edges=jnp.ones((c_senders.shape[0], 1)),
+            n_edge=jnp.full((num_graphs,), self.num_clusters**2)
         )
         
         return coarse_graph, assignments
 
 class MSVIB(nn.Module):
-    """Multi-Scale Variational Information Bottleneck."""
+    """Multi-Scale Variational Information Bottleneck with Hierarchical Pooling."""
     encoder_features: Iterable[int]
     latent_dim: int
-    num_clusters: int
+    num_clusters_list: Iterable[int] # e.g., [16, 4] for multi-step
     output_dim: int = 1
 
     def setup(self):
-        self.encoder = GNNLayer(
+        # Initial encoder for micro-states
+        self.initial_encoder = GNNLayer(
             update_node_fn=lambda n, s, r, g: MLP(self.encoder_features)(n)
         )
-        self.decimator = IterativeDecimator(
-            latent_dim=self.latent_dim,
-            num_clusters=self.num_clusters
-        )
+        
+        # Create multiple decimators and refinement encoders for multi-step renormalization
+        self.decimators = [
+            IterativeDecimator(num_clusters=nc) for nc in self.num_clusters_list
+        ]
+        
+        # Encoders to refine features after each decimation
+        self.refinement_encoders = [
+            GNNLayer(update_node_fn=lambda n, s, r, g: MLP(self.encoder_features)(n))
+            for _ in range(len(self.num_clusters_list))
+        ]
+        
         # Latent distributions for VIB
         self.fc_mu = nn.Dense(self.latent_dim)
         self.fc_logvar = nn.Dense(self.latent_dim)
@@ -107,22 +141,30 @@ class MSVIB(nn.Module):
 
     def __call__(self, graph: jraph.GraphsTuple):
         # 1. Encode Micro-state
-        h = self.encoder(graph)
+        h = self.initial_encoder(graph)
         
-        # 2. Renormalize (Coarse-grain)
-        coarse_graph, assignments = self.decimator(h)
+        # 2. Multi-step Renormalization (RG-like)
+        current_graph = h
+        all_assignments = []
+        for i, decimator in enumerate(self.decimators):
+            current_graph, assignments = decimator(current_graph)
+            all_assignments.append(assignments)
+            # Refine features after decimation
+            current_graph = self.refinement_encoders[i](current_graph)
         
         # 3. Variational Bottleneck on Macro-state
-        # Use segment_mean to handle batches: pooling coarse nodes per graph
+        num_graphs = current_graph.n_node.shape[0]
         batch_indices = jnp.repeat(
-            jnp.arange(len(coarse_graph.n_node)), 
-            coarse_graph.n_node, 
-            total_repeat_length=coarse_graph.nodes.shape[0]
+            jnp.arange(num_graphs), 
+            current_graph.n_node, 
+            total_repeat_length=current_graph.nodes.shape[0]
         )
+        
+        # Global pooling of the final coarse representation
         macro_summary = jraph.segment_mean(
-            coarse_graph.nodes, 
+            current_graph.nodes, 
             batch_indices, 
-            num_segments=len(coarse_graph.n_node)
+            num_segments=num_graphs
         )
         
         mu = self.fc_mu(macro_summary)
@@ -136,7 +178,7 @@ class MSVIB(nn.Module):
         )
         z = mu + eps * std
         
-        # 4. Predict outcome (e.g. future state or property)
+        # 4. Predict outcome
         pred_y = self.predictor(z)
         
-        return mu, logvar, pred_y, assignments, coarse_graph
+        return mu, logvar, pred_y, all_assignments, current_graph
