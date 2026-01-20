@@ -111,36 +111,31 @@ class IterativeDecimator(nn.Module):
         coarse_adj_dense = jnp.transpose(coarse_adj_rows, (1, 0, 2))
         
         # 4. Convert dense coarse adjacency back to sparse
+        # Differentiable sparsification via soft-thresholding
         if self.top_k_edges is not None:
-            # For each cluster, keep only top_k outgoing edges
-            k = min(self.top_k_edges, self.num_clusters)
-            top_vals, top_indices = jax.lax.top_k(coarse_adj_dense, k)
-            
-            # Reconstruct sparse representation
-            single_fc_senders = jnp.repeat(jnp.arange(self.num_clusters), k)
-            single_fc_receivers = top_indices.reshape(num_graphs, -1)
-            
-            batch_offset = jnp.arange(num_graphs)[:, None] * self.num_clusters
-            c_senders = (single_fc_senders[None, :] + batch_offset).reshape(-1)
-            # Use advanced indexing to get receivers correctly for the batch
-            c_receivers = (single_fc_receivers + batch_offset).reshape(-1)
-            
-            c_edge_weights = top_vals.reshape(-1, 1)
-            n_edge_per_graph = self.num_clusters * k
-        else:
-            # Full connectivity (FC)
-            single_fc_senders, single_fc_receivers = jnp.nonzero(
-                jnp.ones((self.num_clusters, self.num_clusters)), 
-                size=self.num_clusters**2
-            )
-            
-            batch_offset = jnp.arange(num_graphs)[:, None] * self.num_clusters
-            c_senders = (single_fc_senders[None, :] + batch_offset).reshape(-1)
-            c_receivers = (single_fc_receivers[None, :] + batch_offset).reshape(-1)
-            
-            # Weights for these edges
-            c_edge_weights = coarse_adj_dense[:, single_fc_senders, single_fc_receivers].reshape(-1, 1)
-            n_edge_per_graph = self.num_clusters**2
+            # We use a learned or heuristic threshold to keep the adjacency sparse
+            # but differentiable.
+            # Temperature-scaled sigmoid mask for 'soft' edge existence
+            temp = 0.1
+            # Heuristic threshold: mean + std of edge weights
+            threshold = jnp.mean(coarse_adj_dense) + jnp.std(coarse_adj_dense)
+            soft_mask = nn.sigmoid((coarse_adj_dense - threshold) / temp)
+            coarse_adj_dense = coarse_adj_dense * soft_mask
+
+        # Full connectivity (FC) for the macro-nodes (usually small enough)
+        # but the weights now carry the differentiability of the 'existence'
+        single_fc_senders, single_fc_receivers = jnp.nonzero(
+            jnp.ones((self.num_clusters, self.num_clusters)), 
+            size=self.num_clusters**2
+        )
+        
+        batch_offset = jnp.arange(num_graphs)[:, None] * self.num_clusters
+        c_senders = (single_fc_senders[None, :] + batch_offset).reshape(-1)
+        c_receivers = (single_fc_receivers[None, :] + batch_offset).reshape(-1)
+        
+        # Weights for these edges
+        c_edge_weights = coarse_adj_dense[:, single_fc_senders, single_fc_receivers].reshape(-1, 1)
+        n_edge_per_graph = self.num_clusters**2
         
         c_n_node = jnp.full((num_graphs,), self.num_clusters)
         

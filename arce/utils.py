@@ -84,6 +84,39 @@ def ising_to_jraph(spins):
         globals=None
     )
 
+def laplacian_eigen_spectrum(graph: jraph.GraphsTuple):
+    """
+    Computes the Eigen-spectrum of the graph Laplacian.
+    Useful for determining the optimal number of clusters (macro-nodes).
+    """
+    num_nodes = graph.n_node[0]
+    # Reconstruct adjacency matrix
+    adj = jnp.zeros((num_nodes, num_nodes))
+    adj = adj.at[graph.senders, graph.receivers].set(1.0)
+    
+    # Normalized Laplacian: L = I - D^-1/2 * A * D^-1/2
+    degree = jnp.sum(adj, axis=1)
+    d_inv_sqrt = jnp.where(degree > 0, 1.0 / jnp.sqrt(degree + 1e-8), 0.0)
+    d_inv_sqrt_mat = jnp.diag(d_inv_sqrt)
+    
+    norm_laplacian = jnp.eye(num_nodes) - d_inv_sqrt_mat @ adj @ d_inv_sqrt_mat
+    
+    # Eigenvalues in ascending order
+    eigs = jnp.linalg.eigvalsh(norm_laplacian)
+    return eigs
+
+def suggest_num_clusters(eigs, threshold=0.1):
+    """
+    Suggests the number of clusters based on the 'eigengap' or 
+    decay of the spectrum.
+    """
+    # Look for the gap in eigenvalues
+    gaps = jnp.diff(eigs)
+    # Heuristic: find where the gap is largest among early eigenvalues
+    # or where eigenvalues exceed a threshold.
+    n_suggested = jnp.argmax(gaps[:len(eigs)//2]) + 1
+    return int(n_suggested)
+
 def plot_information_tradeoff(betas, info_loss, predictive_power):
     """Visualization for Information Loss vs. Predictive Power."""
     import matplotlib.pyplot as plt

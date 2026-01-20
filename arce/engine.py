@@ -49,6 +49,14 @@ class ARCE:
             tx=tx
         )
 
+    def analyze_graph_spectrum(self, sample_graph):
+        """Analyze the Laplacian Eigen-spectrum to suggest optimal cluster count."""
+        from .utils import laplacian_eigen_spectrum, suggest_num_clusters
+        eigs = laplacian_eigen_spectrum(sample_graph)
+        n_suggested = suggest_num_clusters(eigs)
+        print(f"ARCE Spectrum Analysis: Found eigengap suggesting {n_suggested} macro-nodes.")
+        return n_suggested
+
     def coarsen(self, micro_data: jraph.GraphsTuple, rng=None):
         """Returns optimal macro-variables."""
         rngs = {'vmap_rng': rng} if rng is not None else {}
@@ -82,20 +90,30 @@ class ARCE:
 
     @staticmethod
     def _lasso_ista_jax(X_mat, y_mat, alpha=0.01, num_iters=100):
-        """Pure JAX ISTA for differentiable symbolic discovery."""
+        """
+        Pure JAX ISTA for differentiable symbolic discovery.
+        Uses jax.lax.scan to allow gradients to flow through iterations.
+        """
         def soft_threshold(x, thresh):
             return jnp.sign(x) * jnp.maximum(jnp.abs(x) - thresh, 0)
 
         n_feat = X_mat.shape[1]
         n_target = y_mat.shape[1]
-        # Heuristic step size
-        step = 0.1 / (jnp.linalg.norm(X_mat, ord=2)**2 + 1e-5)
         
-        def body(i, w):
+        # Lipschitz constant based step size for stability: step < 1/||X.T @ X||
+        # We use a safe estimate to avoid expensive eigenvalue computation
+        spectral_norm_sq = jnp.linalg.norm(X_mat, ord=2)**2
+        step = 0.5 / (spectral_norm_sq + 1e-5)
+        
+        def scan_body(w, _):
             grad = X_mat.T @ (X_mat @ w - y_mat)
-            return soft_threshold(w - step * grad, alpha * step)
-            
-        return jax.lax.fori_loop(0, num_iters, body, jnp.zeros((n_feat, n_target)))
+            next_w = soft_threshold(w - step * grad, alpha * step)
+            return next_w, None
+
+        # JAX's scan is differentiable, providing an 'unrolled' gradient
+        # which is often more stable than implicit gradients for non-smooth problems.
+        w_final, _ = jax.lax.scan(scan_body, jnp.zeros((n_feat, n_target)), jnp.arange(num_iters))
+        return w_final
 
     def get_basis_features(self, data, include_transcendental=True):
         """Configurable basis library for Symbolic Discovery."""
@@ -221,9 +239,9 @@ class ARCE:
             X_poly = self._get_basis_features_jax(z_t)
             y_dot = z_next - z_t
             
-            # Use stop_gradient for coefficients to treat discovery as inner-loop optimization
-            # but allow gradients to flow back through mu.
-            coeffs = jax.lax.stop_gradient(self._lasso_ista_jax(X_poly, y_dot, alpha=self.config.get('ista_alpha', 0.01)))
+            # Gradient now flows through the ISTA solver!
+            # This allows the model to 'shape' the latent manifold to fit a simpler symbolic grammar.
+            coeffs = self._lasso_ista_jax(X_poly, y_dot, alpha=self.config.get('ista_alpha', 0.01))
             symbolic_residual = y_dot - X_poly @ coeffs
             symbolic_loss = jnp.mean(jnp.square(symbolic_residual))
             
