@@ -24,6 +24,7 @@ class ARCE:
         self.state = None
         # Pre-calculated Micro-EI for Ising Model (approximate baseline)
         self.micro_ei_baseline = 0.5 
+        self.lambda_sparse = config.get('lambda_sparse', 0.01)
 
     def init_model(self, rng, sample_graph):
         variables = self.model.init(rng, sample_graph)
@@ -150,9 +151,14 @@ class ARCE:
             macro_ei = effective_information(t_matrix)
             ce_loss = causal_emergence_loss(micro_ei, macro_ei)
             
+            # 3. Sparsity Regularization (encourages interpretable dynamics)
+            # L1 penalty on the latent transitions
+            delta_mu = mu[1:] - mu[:-1]
+            sparsity_loss = jnp.mean(jnp.abs(delta_mu))
+            
             # Combined Loss (gamma controls the push for emergence)
             gamma = self.config.get('gamma', 0.1)
-            return vib_loss + gamma * ce_loss
+            return vib_loss + gamma * ce_loss + self.lambda_sparse * sparsity_loss
 
         @jax.jit
         def _step(st, g, t, r, mei):

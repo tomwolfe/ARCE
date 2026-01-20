@@ -70,39 +70,63 @@ class IterativeDecimator(nn.Module):
         # Stack to get [num_graphs, num_clusters, node_feat] and reshape to [num_graphs * num_clusters, node_feat]
         coarse_nodes = jnp.stack(coarse_nodes, axis=1).reshape(-1, node_feats.shape[-1])
         
-        # 3. Coarse-grain adjacency (Simplified for batching)
-        # In a real RG, we'd contract edges. For 80/20, we'll use a dense-to-sparse 
-        # approach per graph or maintain a fully connected coarse graph for simplicity.
-        # Here we'll just return the coarse nodes; the next layer can be a MLP or another GNN.
-        # For a full GNN, we'd need to reconstruct the edges.
+        # 3. Coarse-grain adjacency (A' = S^T * A * S)
+        # We need to aggregate micro-edges based on assignments
+        # Micro-edges: senders [E], receivers [E]
+        # assignments: [num_nodes, num_clusters]
         
-        # Reconstruct edges: for each graph, we'll assume a fully connected coarse graph for now
-        # (This is standard in many set-pooling or graph-pooling architectures)
-        c_n_node = jnp.full((num_graphs,), self.num_clusters)
+        # S[i, k] is the probability node i belongs to cluster k
+        # A'_{kl} = sum_{i, j} S[i, k] * A_{ij} * S[j, l]
+        # For each micro-edge (i, j), it contributes S[i, k] * S[j, l] to A'_{kl}
         
-        # Create fully connected edges for each coarse graph
-        def get_fc_edges(n):
-            adj = jnp.ones((n, n))
-            return jnp.nonzero(adj)
+        s_senders = assignments[graph.senders] # [num_edges, num_clusters]
+        s_receivers = assignments[graph.receivers] # [num_edges, num_clusters]
         
-        # For simplicity in batching, we'll return a graph with nodes only or FC edges
-        # To keep it JIT-friendly, we use a fixed size
+        # Contribution to each (k, l) pair
+        # We want to sum over all edges (i, j) in the same graph
+        # For simplicity and JIT-friendliness, we can use a dense intermediate or 
+        # a more efficient segment_sum if we can index (k, l)
+        
+        # Using a dense approach per batch for clarity and since num_clusters is small
+        # [num_edges, num_clusters, num_clusters]
+        edge_contributions = s_senders[:, :, None] * s_receivers[:, None, :]
+        
+        # Sum contributions per graph
+        edge_batch_indices = jnp.repeat(
+            jnp.arange(num_graphs),
+            graph.n_edge,
+            total_repeat_length=graph.senders.shape[0]
+        )
+        
+        # [num_graphs, num_clusters, num_clusters]
+        coarse_adj_dense = jraph.segment_sum(
+            edge_contributions, 
+            edge_batch_indices, 
+            num_segments=num_graphs
+        )
+        
+        # Convert dense coarse adjacency back to sparse (FC-like but with weights)
+        # To maintain fixed shapes for JIT, we keep all clusters connected but use the weights
         single_fc_senders, single_fc_receivers = jnp.nonzero(
             jnp.ones((self.num_clusters, self.num_clusters)), 
             size=self.num_clusters**2
         )
         
-        # Repeat for all graphs in batch
         batch_offset = jnp.arange(num_graphs)[:, None] * self.num_clusters
         c_senders = (single_fc_senders[None, :] + batch_offset).reshape(-1)
         c_receivers = (single_fc_receivers[None, :] + batch_offset).reshape(-1)
+        
+        # Weights for these edges
+        c_edge_weights = coarse_adj_dense[:, single_fc_senders, single_fc_receivers].reshape(-1, 1)
+        
+        c_n_node = jnp.full((num_graphs,), self.num_clusters)
         
         coarse_graph = graph._replace(
             nodes=coarse_nodes,
             n_node=c_n_node,
             senders=c_senders,
             receivers=c_receivers,
-            edges=jnp.ones((c_senders.shape[0], 1)),
+            edges=c_edge_weights,
             n_edge=jnp.full((num_graphs,), self.num_clusters**2)
         )
         
