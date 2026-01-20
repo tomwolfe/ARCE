@@ -38,7 +38,8 @@ class ARCE:
             'ce': jnp.zeros(()),
             'continuity': jnp.zeros(()),
             'sparsity': jnp.zeros(()),
-            'symbolic': jnp.zeros(())
+            'symbolic': jnp.zeros(()),
+            'reconstruction': jnp.zeros(())
         }
         
         self.params = params
@@ -62,7 +63,7 @@ class ARCE:
         rngs = {'vmap_rng': rng} if rng is not None else {}
         # Filter out loss_logvars from params for model call
         model_params = {k: v for k, v in self.state.params.items() if k != 'loss_logvars'}
-        mu, logvar, pred_y, assignments, coarse_graph = self.model.apply(
+        mu, logvar, pred_y, assignments, coarse_graph, recon_micro, h_micro = self.model.apply(
             {'params': model_params}, 
             micro_data,
             rngs=rngs
@@ -193,7 +194,7 @@ class ARCE:
             logvars = params['loss_logvars']
             model_params = {k: v for k, v in params.items() if k != 'loss_logvars'}
             
-            mu, logvar, pred_y, _, _ = self.model.apply(
+            mu, logvar, pred_y, _, _, recon_micro, h_micro = self.model.apply(
                 {'params': model_params}, 
                 graphs,
                 rngs={'vmap_rng': r}
@@ -244,6 +245,10 @@ class ARCE:
             coeffs = self._lasso_ista_jax(X_poly, y_dot, alpha=self.config.get('ista_alpha', 0.01))
             symbolic_residual = y_dot - X_poly @ coeffs
             symbolic_loss = jnp.mean(jnp.square(symbolic_residual))
+
+            # 6. Reconstruction Loss (VAE term)
+            # Tension between compression and preservation of micro-features.
+            reconstruction_loss = jnp.mean(jnp.square(recon_micro - h_micro))
             
             # Dynamic Multi-Task Weighting
             def weighted_loss(L, logv):
@@ -254,7 +259,8 @@ class ARCE:
                 weighted_loss(ce_loss, logvars['ce']) +
                 weighted_loss(continuity_loss, logvars['continuity']) +
                 weighted_loss(sparsity_loss, logvars['sparsity']) +
-                weighted_loss(symbolic_loss, logvars['symbolic'])
+                weighted_loss(symbolic_loss, logvars['symbolic']) +
+                weighted_loss(reconstruction_loss, logvars['reconstruction'])
             )
             
             return total_loss

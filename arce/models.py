@@ -181,17 +181,24 @@ class MSVIB(nn.Module):
         
         # Predictor head
         self.predictor = MLP([32, self.output_dim])
+        
+        # Decoder for reconstruction (NEW)
+        # Reconstructs coarse node features from latent z
+        self.decoder = MLP(list(self.encoder_features[::-1]) + [self.encoder_features[-1] * self.num_clusters_list[-1]])
 
     def __call__(self, graph: jraph.GraphsTuple):
         # 1. Encode Micro-state
-        h = self.initial_encoder(graph)
+        h_micro = self.initial_encoder(graph).nodes
+        h = graph._replace(nodes=h_micro)
         
         # 2. Multi-step Renormalization (RG-like)
         current_graph = h
         all_assignments = []
+        n_node_history = [graph.n_node]
         for i, decimator in enumerate(self.decimators):
             current_graph, assignments = decimator(current_graph)
             all_assignments.append(assignments)
+            n_node_history.append(current_graph.n_node)
             # Refine features after decimation
             current_graph = self.refinement_encoders[i](current_graph)
         
@@ -224,4 +231,37 @@ class MSVIB(nn.Module):
         # 4. Predict outcome
         pred_y = self.predictor(z)
         
-        return mu, logvar, pred_y, all_assignments, current_graph
+        # 5. Reconstruction (NEW)
+        # Reconstruct final coarse nodes from z
+        h_final_coarse_recon = self.decoder(z) # [num_graphs, num_clusters_final * feat]
+        h_final_coarse_recon = h_final_coarse_recon.reshape(num_graphs, self.num_clusters_list[-1], -1)
+        
+        # Back-project through the hierarchy
+        curr_h_recon = h_final_coarse_recon
+        for i in reversed(range(len(all_assignments))):
+            S = all_assignments[i] # [total_nodes_prev, num_clusters_curr]
+            
+            # Map batch indices to nodes
+            prev_n_node = n_node_history[i]
+            prev_batch_indices = jnp.repeat(
+                jnp.arange(num_graphs), 
+                prev_n_node, 
+                total_repeat_length=S.shape[0]
+            )
+            
+            # H_prev[i] = sum_k S[i, k] * H_curr[batch(i), k]
+            # Using gather to get H_curr for the correct graph
+            h_curr_per_node = curr_h_recon[prev_batch_indices] # [total_nodes_prev, num_clusters_curr, feat]
+            
+            # Weighted sum over clusters
+            # S[:, :, None] * h_curr_per_node
+            curr_h_recon = jnp.sum(S[..., None] * h_curr_per_node, axis=1) # [total_nodes_prev, feat]
+            
+            # If not the last step, reshape for next iteration
+            if i > 0:
+                num_clusters_prev = self.num_clusters_list[i-1]
+                curr_h_recon = curr_h_recon.reshape(num_graphs, num_clusters_prev, -1)
+        
+        recon_micro = curr_h_recon # [total_nodes_micro, feat]
+        
+        return mu, logvar, pred_y, all_assignments, current_graph, recon_micro, h_micro

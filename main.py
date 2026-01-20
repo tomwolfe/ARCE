@@ -52,8 +52,9 @@ def train_arce(engine, num_epochs=20):
         if epoch % 5 == 0:
             # Quick loss check on first sample
             first_seq_batch = jraph.batch(train_sequences[0])
-            mu, logvar, pred_y, _, _ = engine.model.apply(
-                {'params': engine.state.params}, 
+            model_params = {k: v for k, v in engine.state.params.items() if k != 'loss_logvars'}
+            mu, logvar, pred_y, _, _, _, _ = engine.model.apply(
+                {'params': model_params}, 
                 first_seq_batch,
                 rngs={'vmap_rng': jax.random.PRNGKey(0)}
             )

@@ -93,13 +93,22 @@ def soft_histogram2d(x, y, bins=10, bandwidth=None, adaptive_range=True):
     if bandwidth is None:
         # Silverman's rule of thumb inspired adaptive bandwidth
         n_samples = x.shape[0]
-        std_x = jnp.std(x) + 1e-5
-        std_y = jnp.std(y) + 1e-5
+        # Use robust variance to avoid NaN gradients at zero variance
+        var_x = jnp.var(x)
+        var_y = jnp.var(y)
+        std_x = jnp.sqrt(var_x + 1e-9)
+        std_y = jnp.sqrt(var_y + 1e-9)
+        
+        # Rule of thumb with a floor to prevent "emptying out"
         bandwidth_x = 1.06 * std_x * (n_samples**(-1/5))
         bandwidth_y = 1.06 * std_y * (n_samples**(-1/5))
+        
         # Normalize by range for the Gaussian kernel calculation
-        bandwidth_x /= (x_max - x_min + 1e-5)
-        bandwidth_y /= (y_max - y_min + 1e-5)
+        # and ensure a minimum relative bandwidth (e.g., 5% of range)
+        range_x = x_max - x_min + 1e-5
+        range_y = y_max - y_min + 1e-5
+        bandwidth_x = jnp.maximum(bandwidth_x / range_x, 0.05)
+        bandwidth_y = jnp.maximum(bandwidth_y / range_y, 0.05)
     else:
         bandwidth_x = bandwidth
         bandwidth_y = bandwidth
@@ -110,10 +119,12 @@ def soft_histogram2d(x, y, bins=10, bandwidth=None, adaptive_range=True):
     y_dist = jnp.square((y[:, None] - y_centers[None, :]) / (y_max - y_min + 1e-5))
     
     # Gaussian kernel with adaptive or fixed bandwidth
-    x_weights = jnp.exp(-x_dist / (2 * jnp.maximum(bandwidth_x, 1e-3)**2))
+    # Added small constant to weights to ensure non-zero gradients everywhere
+    eps_grad = 1e-4
+    x_weights = jnp.exp(-x_dist / (2 * jnp.maximum(bandwidth_x, 1e-3)**2)) + eps_grad
     x_weights /= (jnp.sum(x_weights, axis=-1, keepdims=True) + 1e-8)
     
-    y_weights = jnp.exp(-y_dist / (2 * jnp.maximum(bandwidth_y, 1e-3)**2))
+    y_weights = jnp.exp(-y_dist / (2 * jnp.maximum(bandwidth_y, 1e-3)**2)) + eps_grad
     y_weights /= (jnp.sum(y_weights, axis=-1, keepdims=True) + 1e-8)
     
     return jnp.matmul(x_weights.T, y_weights)
