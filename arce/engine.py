@@ -37,7 +37,8 @@ class ARCE:
             'task': jnp.zeros(()),
             'ce': jnp.zeros(()),
             'continuity': jnp.zeros(()),
-            'sparsity': jnp.zeros(())
+            'sparsity': jnp.zeros(()),
+            'symbolic': jnp.zeros(())
         }
         
         self.params = params
@@ -60,29 +61,57 @@ class ARCE:
         )
         return coarse_graph, mu
 
-    def get_basis_features(self, data, include_transcendental=True):
-        """Configurable basis library for Symbolic Discovery."""
+    @staticmethod
+    def _get_basis_features_jax(data, include_transcendental=True):
+        """Pure JAX version of basis library for JIT compatibility."""
         n, d = data.shape
         # Linear and Bias
         feats = [jnp.ones((n, 1)), data]
-        names = ["1"] + [f"M{i}" for i in range(d)]
         
         # Quadratic
         for i in range(d):
             for j in range(i, d):
                 feats.append((data[:, i] * data[:, j])[:, None])
-                names.append(f"M{i}*M{j}")
         
         if include_transcendental:
-            # Transcendental (expanded basis)
             feats.append(jnp.sin(data))
-            names += [f"sin(M{i})" for i in range(d)]
             feats.append(jnp.cos(data))
+            feats.append(jnp.exp(-jnp.square(data)))
+            
+        return jnp.concatenate(feats, axis=-1)
+
+    @staticmethod
+    def _lasso_ista_jax(X_mat, y_mat, alpha=0.01, num_iters=100):
+        """Pure JAX ISTA for differentiable symbolic discovery."""
+        def soft_threshold(x, thresh):
+            return jnp.sign(x) * jnp.maximum(jnp.abs(x) - thresh, 0)
+
+        n_feat = X_mat.shape[1]
+        n_target = y_mat.shape[1]
+        # Heuristic step size
+        step = 0.1 / (jnp.linalg.norm(X_mat, ord=2)**2 + 1e-5)
+        
+        def body(i, w):
+            grad = X_mat.T @ (X_mat @ w - y_mat)
+            return soft_threshold(w - step * grad, alpha * step)
+            
+        return jax.lax.fori_loop(0, num_iters, body, jnp.zeros((n_feat, n_target)))
+
+    def get_basis_features(self, data, include_transcendental=True):
+        """Configurable basis library for Symbolic Discovery."""
+        n, d = data.shape
+        X_poly = self._get_basis_features_jax(data, include_transcendental)
+        
+        names = ["1"] + [f"M{i}" for i in range(d)]
+        for i in range(d):
+            for j in range(i, d):
+                names.append(f"M{i}*M{j}")
+        if include_transcendental:
+            names += [f"sin(M{i})" for i in range(d)]
             names += [f"cos(M{i})" for i in range(d)]
-            feats.append(jnp.exp(-jnp.square(data))) # Gaussian kernels
             names += [f"exp(-M{i}^2)" for i in range(d)]
             
-        return jnp.concatenate(feats, axis=-1), names
+        return X_poly, names
 
     def discover_dynamics(self, time_series_graphs):
         """
@@ -107,22 +136,7 @@ class ARCE:
         X_poly, names = self.get_basis_features(X)
 
         # 4. JAX-native Sparse Regression (ISTA)
-        def soft_threshold(x, thresh):
-            return jnp.sign(x) * jnp.maximum(jnp.abs(x) - thresh, 0)
-
-        def lasso_ista(X_mat, y_mat, alpha=0.01, num_iters=1000):
-            n_feat = X_mat.shape[1]
-            n_target = y_mat.shape[1]
-            # Use a slightly more robust step size calculation
-            step = 0.5 / (jnp.linalg.norm(X_mat, ord=2)**2 + 1e-5)
-            
-            def body(i, w):
-                grad = X_mat.T @ (X_mat @ w - y_mat)
-                return soft_threshold(w - step * grad, alpha * step)
-                
-            return jax.lax.fori_loop(0, num_iters, body, jnp.zeros((n_feat, n_target)))
-
-        coeffs = lasso_ista(X_poly, y, alpha=self.config.get('ista_alpha', 0.01))
+        coeffs = self._lasso_ista_jax(X_poly, y, alpha=self.config.get('ista_alpha', 0.01))
         
         # 5. Format the discovered equation
         equations = []
@@ -200,6 +214,18 @@ class ARCE:
             # 4. Sparsity Regularization
             delta_mu = mu[1:] - mu[:-1]
             sparsity_loss = jnp.mean(jnp.abs(delta_mu))
+
+            # 5. Symbolic Discovery Feedback (End-to-End)
+            # We use ISTA inside the loss function to find sparse coefficients
+            # and penalize the residual of the discovered equation.
+            X_poly = self._get_basis_features_jax(z_t)
+            y_dot = z_next - z_t
+            
+            # Use stop_gradient for coefficients to treat discovery as inner-loop optimization
+            # but allow gradients to flow back through mu.
+            coeffs = jax.lax.stop_gradient(self._lasso_ista_jax(X_poly, y_dot, alpha=self.config.get('ista_alpha', 0.01)))
+            symbolic_residual = y_dot - X_poly @ coeffs
+            symbolic_loss = jnp.mean(jnp.square(symbolic_residual))
             
             # Dynamic Multi-Task Weighting
             def weighted_loss(L, logv):
@@ -209,7 +235,8 @@ class ARCE:
                 weighted_loss(task_loss, logvars['task']) +
                 weighted_loss(ce_loss, logvars['ce']) +
                 weighted_loss(continuity_loss, logvars['continuity']) +
-                weighted_loss(sparsity_loss, logvars['sparsity'])
+                weighted_loss(sparsity_loss, logvars['sparsity']) +
+                weighted_loss(symbolic_loss, logvars['symbolic'])
             )
             
             return total_loss

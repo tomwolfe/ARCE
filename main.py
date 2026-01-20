@@ -15,17 +15,17 @@ def train_arce(engine, num_epochs=20):
     targets = []
     
     for T in [1.5, 2.26, 3.5]:
-        for _ in range(2): # 2 sequences per temperature
+        for _ in range(3): # 3 sequences per temperature
             seq = []
             rng, subkey = jax.random.split(rng)
-            spins = generate_ising_2d(L=8, T=T, steps=100, key=subkey)
-            for _ in range(5): # Sequence length 5
+            spins = generate_ising_2d(L=8, T=T, steps=200, key=subkey)
+            for _ in range(10): # Sequence length 10
                 graph = ising_to_jraph(spins)
                 seq.append(graph)
                 
                 # Evolve system
                 rng, subkey = jax.random.split(rng)
-                spins = generate_ising_2d(L=8, T=T, steps=10, key=subkey)
+                spins = generate_ising_2d(L=8, T=T, steps=20, key=subkey)
                 
             train_sequences.append(seq)
             # Target for the LAST state in sequence is its magnetization 
@@ -64,12 +64,13 @@ def main():
     
     # 1. Configuration
     config = {
-        'encoder_features': [16, 8], # Smaller networks for demo
+        'encoder_features': [32, 16], # Slightly larger networks
         'latent_dim': 2,
         'num_clusters_list': [8, 4], # Hierarchical pooling: 64 -> 8 -> 4 nodes
         'lr': 1e-3,
         'top_k_edges': 3,            # Sparse coarsening: keep top 3 edges per cluster
-        'use_gaussian_ei': False     # Use robust non-parametric EI
+        'use_gaussian_ei': True,      # Use Gaussian EI for more stable training gradients
+        'ista_alpha': 0.05            # Sparsity penalty for symbolic discovery
     }
     
     # 2. Initialize Engine

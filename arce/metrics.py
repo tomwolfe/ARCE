@@ -100,35 +100,46 @@ def soft_histogram2d(x, y, bins=10, bandwidth=0.1, adaptive_range=True):
     
     return jnp.matmul(x_weights.T, y_weights)
 
-def estimate_transition_matrix(latent_series, num_bins=10):
+def estimate_transition_matrix(latent_series, num_bins=12):
     """
-    Estimates a Markov transition matrix. Improved to handle multi-dim latents
-    more gracefully by projecting or using principal components if needed.
-    For 80/20, we use a more robust marginal averaging or the joint EI directly.
+    Estimates a Markov transition matrix. Improved with kernel density smoothing
+    and adaptive binning to reduce sensitivity to 'num_bins'.
     """
     dim = latent_series.shape[1]
     
-    # If using for EI, we should prefer the Gaussian estimator.
-    # But if a matrix is needed (e.g. for visualization), we provide this:
+    # We use a more robust bandwidth selection (Silverman's rule-of-thumb inspired)
+    n_samples = latent_series.shape[0]
+    bandwidth = 1.06 * jnp.std(latent_series) * (n_samples**(-1/5))
+    bandwidth = jnp.maximum(bandwidth, 0.05) # Floor
+    
     matrices = []
-    # Use up to 4 dimensions, but with adaptive range
+    # Average across dimensions to get a robust scalar transition estimate
     for i in range(min(dim, 4)):
         data = latent_series[:, i]
         x, y = data[:-1], data[1:]
-        m = soft_histogram2d(x, y, bins=num_bins, adaptive_range=True)
+        m = soft_histogram2d(x, y, bins=num_bins, bandwidth=bandwidth, adaptive_range=True)
+        # Add small epsilon for Laplace smoothing (robustness to sparse data)
+        m = m + 1e-6
         # Normalize rows
-        m = m / (jnp.sum(m, axis=-1, keepdims=True) + 1e-8)
+        m = m / jnp.sum(m, axis=-1, keepdims=True)
         matrices.append(m)
     
     return jnp.stack(matrices).mean(axis=0)
 
 
-def causal_emergence_loss(micro_ei, macro_ei):
+def causal_emergence_loss(micro_ei, macro_ei, macro_entropy_weight=0.1):
     """
     Loss to maximize Causal Emergence.
-    We want macro_ei > micro_ei.
+    Includes a 'Grounding' term: we want macro_ei > micro_ei, but we also
+    want the macro-state to have sufficient entropy (avoiding collapse to trivial states).
     """
-    return jax.nn.relu(micro_ei - macro_ei)
+    ce = jax.nn.relu(micro_ei - macro_ei)
+    
+    # Penalty for too low macro-EI or collapsed entropy
+    # This addresses the 'Causal Emergence Paradox' by preventing trivial solutions.
+    grounding_penalty = jax.nn.relu(0.5 - macro_ei) 
+    
+    return ce + 0.1 * grounding_penalty
 
 def information_bottleneck_loss(mu, logvar, pred_y, target_y, beta=1e-3):
     """

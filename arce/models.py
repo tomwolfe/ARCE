@@ -93,18 +93,22 @@ class IterativeDecimator(nn.Module):
             total_repeat_length=graph.senders.shape[0]
         )
 
-        def compute_coarse_adj_row(k):
-            # Contribution of cluster k as sender to all other clusters
-            # Use jnp.take to avoid slice with tracer issues
+        # Optimization: Use jax.lax.scan instead of vmap to keep memory footprint at O(E * K)
+        # instead of O(K * E * K) which would happen if vmap parallelizes over K.
+        def scan_body(carry, k):
             sender_k = jnp.take(s_senders, k, axis=1)[:, None]
             contributions_k = sender_k * s_receivers
-            # Sum per graph: [num_graphs, num_clusters]
-            return jraph.segment_sum(contributions_k, edge_batch_indices, num_segments=num_graphs)
+            row_k = jraph.segment_sum(contributions_k, edge_batch_indices, num_segments=num_graphs)
+            return carry, row_k
 
-        # [num_clusters, num_graphs, num_clusters]
-        coarse_adj_dense = jax.vmap(compute_coarse_adj_row)(jnp.arange(self.num_clusters))
+        _, coarse_adj_rows = jax.lax.scan(
+            scan_body, 
+            None, 
+            jnp.arange(self.num_clusters)
+        )
+        # coarse_adj_rows is [num_clusters, num_graphs, num_clusters]
         # Transpose to [num_graphs, num_clusters, num_clusters]
-        coarse_adj_dense = jnp.transpose(coarse_adj_dense, (1, 0, 2))
+        coarse_adj_dense = jnp.transpose(coarse_adj_rows, (1, 0, 2))
         
         # 4. Convert dense coarse adjacency back to sparse
         if self.top_k_edges is not None:
