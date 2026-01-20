@@ -27,32 +27,22 @@ def effective_information(transition_matrix):
 def estimate_transition_matrix(latent_series, num_bins=10):
     """
     Estimates a Markov transition matrix from a sequence of latent states.
-    Uses simple histogram binning for demonstration.
+    Uses vectorized operations for JAX compatibility.
     """
-    # Flatten to 1D for simple binning if necessary, 
-    # or handle multidimensional binning.
-    # Here we take the first dimension as the 'state'.
+    # Use only the first dimension for state estimation as in the original
     data = latent_series[:, 0]
     
     # Map data to bins
     min_val, max_val = jnp.min(data), jnp.max(data)
-    bins = jnp.linspace(min_val, max_val, num_bins + 1)
     
-    indices = jnp.digitize(data, bins) - 1
-    indices = jnp.clip(indices, 0, num_bins - 1)
+    # Create transitions (t -> t+1)
+    x = data[:-1]
+    y = data[1:]
     
-    # Count transitions
-    matrix = jnp.zeros((num_bins, num_bins))
+    # Vectorized binning and counting using histogram2d
+    range_lims = [[min_val, max_val], [min_val, max_val]]
+    matrix, _, _ = jnp.histogram2d(x, y, bins=num_bins, range=range_lims)
     
-    def update_matrix(m, idx_pair):
-        i, j = idx_pair
-        return m.at[i, j].add(1)
-    
-    # This is a bit slow in pure JAX without scan/vmap, 
-    # but for demo it's fine.
-    for t in range(len(indices) - 1):
-        matrix = update_matrix(matrix, (indices[t], indices[t+1]))
-        
     # Normalize rows
     row_sums = jnp.sum(matrix, axis=-1, keepdims=True)
     matrix = matrix / (row_sums + 1e-8)
