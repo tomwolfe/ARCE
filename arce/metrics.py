@@ -133,13 +133,13 @@ def estimate_transition_matrix(latent_series, num_bins=12):
     """
     Estimates a Markov transition matrix. Improved with kernel density smoothing
     and adaptive binning to reduce sensitivity to 'num_bins'.
+    Now uses all latent dimensions to avoid heuristic bias.
     """
     dim = latent_series.shape[1]
     
     matrices = []
-    # Average across dimensions to get a robust scalar transition estimate
-    # Use adaptive bandwidth within soft_histogram2d
-    for i in range(min(dim, 4)):
+    # Use all dimensions (Point 3)
+    for i in range(dim):
         data = latent_series[:, i]
         x, y = data[:-1], data[1:]
         m = soft_histogram2d(x, y, bins=num_bins, bandwidth=None, adaptive_range=True)

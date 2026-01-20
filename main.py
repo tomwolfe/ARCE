@@ -52,10 +52,11 @@ def train_arce(engine, num_epochs=20):
         if epoch % 5 == 0:
             # Quick loss check on first sample
             first_seq_batch = jraph.batch(train_sequences[0])
-            model_params = {k: v for k, v in engine.state.params.items() if k != 'loss_logvars'}
-            mu, logvar, pred_y, _, _, _, _ = engine.model.apply(
+            model_params = {k: v for k, v in engine.state.params.items() if k not in ['loss_logvars', 'symbolic_coeffs']}
+            mu, logvar, pred_y, _, _, _, _, _ = engine.model.apply(
                 {'params': model_params}, 
                 first_seq_batch,
+                training=False,
                 rngs={'vmap_rng': jax.random.PRNGKey(0)}
             )
             print(f"Epoch {epoch} | Latent Mean (first sample): {float(mu.mean()):.4f}")

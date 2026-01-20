@@ -39,8 +39,15 @@ class ARCE:
             'continuity': jnp.zeros(()),
             'sparsity': jnp.zeros(()),
             'symbolic': jnp.zeros(()),
-            'reconstruction': jnp.zeros(())
+            'reconstruction': jnp.zeros(()),
+            'predictive': jnp.zeros(()),
+            'topo_sparsity': jnp.zeros(())
         }
+
+        # Initialize global symbolic coefficients (Recommendation 1)
+        d = self.config.get('latent_dim', 16)
+        n_basis = 1 + 4 * d + (d * (d + 1)) // 2
+        params['symbolic_coeffs'] = jnp.zeros((n_basis, d))
         
         self.params = params
         tx = optax.adam(learning_rate=self.config.get('lr', 1e-3))
@@ -60,12 +67,17 @@ class ARCE:
 
     def coarsen(self, micro_data: jraph.GraphsTuple, rng=None):
         """Returns optimal macro-variables."""
-        rngs = {'vmap_rng': rng} if rng is not None else {}
-        # Filter out loss_logvars from params for model call
-        model_params = {k: v for k, v in self.state.params.items() if k != 'loss_logvars'}
-        mu, logvar, pred_y, assignments, coarse_graph, recon_micro, h_micro = self.model.apply(
+        rngs = {}
+        if rng is not None:
+            rng1, rng2 = jax.random.split(rng)
+            rngs = {'vmap_rng': rng1, 'gumbel': rng2}
+        
+        # Filter out loss_logvars and symbolic_coeffs from params for model call
+        model_params = {k: v for k, v in self.state.params.items() if k not in ['loss_logvars', 'symbolic_coeffs']}
+        mu, logvar, pred_y, assignments, coarse_graph, recon_micro, h_micro, all_coarse_adjs = self.model.apply(
             {'params': model_params}, 
             micro_data,
+            training=False,
             rngs=rngs
         )
         return coarse_graph, mu
@@ -90,7 +102,7 @@ class ARCE:
         return jnp.concatenate(feats, axis=-1)
 
     @staticmethod
-    def _lasso_ista_jax(X_mat, y_mat, alpha=0.01, num_iters=100):
+    def _lasso_ista_jax(X_mat, y_mat, alpha=0.01, num_iters=100, initial_w=None):
         """
         Pure JAX ISTA for differentiable symbolic discovery.
         Uses jax.lax.scan to allow gradients to flow through iterations.
@@ -101,19 +113,18 @@ class ARCE:
         n_feat = X_mat.shape[1]
         n_target = y_mat.shape[1]
         
-        # Lipschitz constant based step size for stability: step < 1/||X.T @ X||
-        # We use a safe estimate to avoid expensive eigenvalue computation
         spectral_norm_sq = jnp.linalg.norm(X_mat, ord=2)**2
         step = 0.5 / (spectral_norm_sq + 1e-5)
         
+        if initial_w is None:
+            initial_w = jnp.zeros((n_feat, n_target))
+
         def scan_body(w, _):
             grad = X_mat.T @ (X_mat @ w - y_mat)
             next_w = soft_threshold(w - step * grad, alpha * step)
             return next_w, None
 
-        # JAX's scan is differentiable, providing an 'unrolled' gradient
-        # which is often more stable than implicit gradients for non-smooth problems.
-        w_final, _ = jax.lax.scan(scan_body, jnp.zeros((n_feat, n_target)), jnp.arange(num_iters))
+        w_final, _ = jax.lax.scan(scan_body, initial_w, jnp.arange(num_iters))
         return w_final
 
     def get_basis_features(self, data, include_transcendental=True):
@@ -154,8 +165,8 @@ class ARCE:
         # 3. Features from configurable library
         X_poly, names = self.get_basis_features(X)
 
-        # 4. JAX-native Sparse Regression (ISTA)
-        coeffs = self._lasso_ista_jax(X_poly, y, alpha=self.config.get('ista_alpha', 0.01))
+        # 4. Use the learned global coefficients
+        coeffs = self.state.params['symbolic_coeffs']
         
         # 5. Format the discovered equation
         equations = []
@@ -192,12 +203,15 @@ class ARCE:
         def loss_fn(params, graphs, y, r, micro_ei):
             # Extract logvars for dynamic weighting
             logvars = params['loss_logvars']
-            model_params = {k: v for k, v in params.items() if k != 'loss_logvars'}
+            global_coeffs = params['symbolic_coeffs']
+            model_params = {k: v for k, v in params.items() if k not in ['loss_logvars', 'symbolic_coeffs']}
             
-            mu, logvar, pred_y, _, _, recon_micro, h_micro = self.model.apply(
+            r1, r2 = jax.random.split(r)
+            mu, logvar, pred_y, _, _, recon_micro, h_micro, all_coarse_adjs = self.model.apply(
                 {'params': model_params}, 
                 graphs,
-                rngs={'vmap_rng': r}
+                training=True,
+                rngs={'vmap_rng': r1, 'gumbel': r2}
             )
             
             # 1. Causal Emergence Loss (Robust)
@@ -235,21 +249,33 @@ class ARCE:
             sparsity_loss = jnp.mean(jnp.abs(delta_mu))
 
             # 5. Symbolic Discovery Feedback (End-to-End)
-            # We use ISTA inside the loss function to find sparse coefficients
-            # and penalize the residual of the discovered equation.
             X_poly = self._get_basis_features_jax(z_t)
             y_dot = z_next - z_t
             
-            # Gradient now flows through the ISTA solver!
-            # This allows the model to 'shape' the latent manifold to fit a simpler symbolic grammar.
-            coeffs = self._lasso_ista_jax(X_poly, y_dot, alpha=self.config.get('ista_alpha', 0.01))
-            symbolic_residual = y_dot - X_poly @ coeffs
+            # Use global coeffs from TrainState (Recommendation 1)
+            # We can still use ISTA locally to 'guide' the global coeffs or just use SGD.
+            # Here we use the global_coeffs directly to compute the residual.
+            symbolic_residual = y_dot - X_poly @ global_coeffs
             symbolic_loss = jnp.mean(jnp.square(symbolic_residual))
 
             # 6. Reconstruction Loss (VAE term)
-            # Tension between compression and preservation of micro-features.
             reconstruction_loss = jnp.mean(jnp.square(recon_micro - h_micro))
             
+            # 7. Predictive Information Loss (Recommendation 3 / Point 5)
+            # Instead of reconstructing micro, we optimize macro to be a sufficient
+            # statistic for the future macro-state.
+            # Simple version: z_t should be able to predict z_{t+1} via a small MLP
+            # or just the symbolic model. We use the symbolic residual as part of this,
+            # but we can also add a more general predictive term.
+            predictive_loss = continuity_loss # For now, continuity is a form of predictive info
+            
+            # 8. Topological Sparsity (Recommendation 2 / Point 2)
+            # L1 penalty on the macro-adjacency matrices
+            topo_sparsity_loss = sum(jnp.mean(jnp.abs(adj)) for adj in all_coarse_adjs)
+
+            # 9. Symbolic Sparsity (L1 on coefficients)
+            symbolic_sparsity_loss = jnp.mean(jnp.abs(global_coeffs))
+
             # Dynamic Multi-Task Weighting
             def weighted_loss(L, logv):
                 return jnp.exp(-logv) * L + logv
@@ -260,7 +286,10 @@ class ARCE:
                 weighted_loss(continuity_loss, logvars['continuity']) +
                 weighted_loss(sparsity_loss, logvars['sparsity']) +
                 weighted_loss(symbolic_loss, logvars['symbolic']) +
-                weighted_loss(reconstruction_loss, logvars['reconstruction'])
+                weighted_loss(reconstruction_loss, logvars['reconstruction']) * 0.1 + # Reduced weight (Point 5)
+                weighted_loss(predictive_loss, logvars['predictive']) +
+                weighted_loss(topo_sparsity_loss, logvars['topo_sparsity']) +
+                weighted_loss(symbolic_sparsity_loss, logvars['sparsity']) # Use sparsity logvar
             )
             
             return total_loss

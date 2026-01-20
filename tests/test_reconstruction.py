@@ -26,10 +26,11 @@ def test_reconstruction_flow():
     # (Actually, I updated coarsen in engine.py to return coarse_graph, mu only. 
     # Let's check engine.py again)
     
-    model_params = {k: v for k, v in engine.state.params.items() if k != 'loss_logvars'}
-    mu, logvar, pred_y, assignments, coarse_graph, recon_micro, h_micro = engine.model.apply(
+    model_params = {k: v for k, v in engine.state.params.items() if k not in ['loss_logvars', 'symbolic_coeffs']}
+    mu, logvar, pred_y, assignments, coarse_graph, recon_micro, h_micro, all_coarse_adjs = engine.model.apply(
         {'params': model_params}, 
         graph,
+        training=False,
         rngs={'vmap_rng': rng}
     )
     
@@ -38,10 +39,11 @@ def test_reconstruction_flow():
     
     # Test that gradients flow from reconstruction loss to params
     def recon_loss_fn(params):
-        m_params = {k: v for k, v in params.items() if k != 'loss_logvars'}
-        _, _, _, _, _, r_micro, h_m = engine.model.apply(
+        m_params = {k: v for k, v in params.items() if k not in ['loss_logvars', 'symbolic_coeffs']}
+        _, _, _, _, _, r_micro, h_m, _ = engine.model.apply(
             {'params': m_params}, 
             graph,
+            training=True,
             rngs={'vmap_rng': rng}
         )
         return jnp.mean(jnp.square(r_micro - h_m))
