@@ -32,15 +32,12 @@ def estimate_transition_matrix(latent_series, num_bins=10):
     # Use only the first dimension for state estimation as in the original
     data = latent_series[:, 0]
     
-    # Map data to bins
-    min_val, max_val = jnp.min(data), jnp.max(data)
-    
     # Create transitions (t -> t+1)
     x = data[:-1]
     y = data[1:]
     
-    # Vectorized binning and counting using histogram2d
-    range_lims = [[min_val, max_val], [min_val, max_val]]
+    # Use fixed range for JIT compatibility
+    range_lims = [[-3.0, 3.0], [-3.0, 3.0]]
     matrix, _, _ = jnp.histogram2d(x, y, bins=num_bins, range=range_lims)
     
     # Normalize rows
@@ -54,7 +51,7 @@ def causal_emergence_loss(micro_ei, macro_ei):
     Loss to maximize Causal Emergence.
     We want macro_ei > micro_ei.
     """
-    return jnp.relu(micro_ei - macro_ei)
+    return jax.nn.relu(micro_ei - macro_ei)
 
 def information_bottleneck_loss(mu, logvar, pred_y, target_y, beta=1e-3):
     """

@@ -3,20 +3,31 @@ import jax.numpy as jnp
 from arce.engine import ARCE
 from arce.utils import generate_ising_2d, ising_to_jraph, plot_information_tradeoff
 import numpy as np
+import jraph
 
 def train_arce(engine, num_epochs=20):
     print("ARCE: Training on Ising Data...")
     rng = jax.random.PRNGKey(42)
     
     # Generate training data: configurations at various temperatures
-    # Smaller L and fewer samples for speed
-    train_data = []
+    # We use sequences to allow for Causal Emergence estimation
+    train_sequences = []
     targets = []
-    for T in [1.5, 2.26, 3.5]: # Just 3 representative temps
-        for _ in range(3):
-            spins = generate_ising_2d(L=6, T=T, steps=200)
-            graph = ising_to_jraph(spins)
-            train_data.append(graph)
+    
+    for T in [1.5, 2.26, 3.5]:
+        for _ in range(2): # 2 sequences per temperature
+            seq = []
+            spins = generate_ising_2d(L=8, T=T, steps=100)
+            for _ in range(5): # Sequence length 5
+                graph = ising_to_jraph(spins)
+                seq.append(graph)
+                
+                # Evolve system
+                spins = generate_ising_2d(L=8, T=T, steps=10)
+                
+            train_sequences.append(seq)
+            # Target for the LAST state in sequence is its magnetization 
+            # (or we could predict next magnetization for each step)
             targets.append(np.abs(np.mean(spins)))
             
     targets = jnp.array(targets).reshape(-1, 1)
@@ -24,24 +35,27 @@ def train_arce(engine, num_epochs=20):
     # Training Loop
     for epoch in range(num_epochs):
         epoch_loss = 0
-        for i in range(len(train_data)):
+        for i in range(len(train_sequences)):
+            # Convert sequence to a single padded GraphsTuple for processing
+            batch_graph = jraph.batch(train_sequences[i])
             rng, step_rng = jax.random.split(rng)
             engine.state = engine.train_step(
                 engine.state, 
-                train_data[i], 
+                batch_graph, 
                 targets[i:i+1], 
                 step_rng
             )
             
         if epoch % 5 == 0:
             # Quick loss check on first sample
+            first_seq_batch = jraph.batch(train_sequences[0])
             mu, logvar, pred_y, _, _ = engine.model.apply(
                 {'params': engine.state.params}, 
-                train_data[0],
+                first_seq_batch,
                 rngs={'vmap_rng': jax.random.PRNGKey(0)}
             )
             from arce.metrics import information_bottleneck_loss
-            loss = information_bottleneck_loss(mu, logvar, pred_y, targets[0:1])
+            loss = information_bottleneck_loss(mu[-1:], logvar[-1:], pred_y[-1:], targets[0:1])
             print(f"Epoch {epoch} | Sample 0 Loss: {loss:.4f}")
 
 def main():

@@ -53,16 +53,21 @@ class IterativeDecimator(nn.Module):
         coarse_nodes = jnp.matmul(assignments.T, node_feats) # [num_clusters, node_feat]
         
         # 2. Coarse-grain adjacency matrix (Edge Contraction): A_macro = S^T * A_micro * S
-        # Create dense adjacency from senders/receivers
-        adj = jnp.zeros((num_nodes, num_nodes))
-        if graph.senders is not None and len(graph.senders) > 0:
-            adj = adj.at[graph.senders, graph.receivers].set(1.0)
-            
-        coarse_adj = jnp.matmul(assignments.T, jnp.matmul(adj, assignments))
+        # Compute sparsely: A_macro_{kl} = \sum_{ij} S_{ik} * A_{ij} * S_{jl}
+        # For each edge (i, j) with weight w, we add w * S_i.T @ S_j to the coarse adjacency
+        
+        # Get assignment vectors for senders and receivers
+        s_senders = assignments[graph.senders]    # [num_edges, num_clusters]
+        s_receivers = assignments[graph.receivers] # [num_edges, num_clusters]
+        
+        # Weighted contraction if edges have features, otherwise assume 1.0
+        edge_weights = graph.edges if graph.edges is not None else jnp.ones((graph.senders.shape[0], 1))
+        
+        # A_macro = (S_senders * weights).T @ S_receivers
+        coarse_adj = jnp.matmul((s_senders * edge_weights).T, s_receivers) # [num_clusters, num_clusters]
         
         # Extract new edges from coarse_adj
-        # For simplicity in this demo, we keep it as a fully connected graph with weighted edges
-        # or we could threshold it. Here we use all non-zero entries.
+        # We maintain static shapes for JIT by using a fixed number of potential edges
         c_senders, c_receivers = jnp.nonzero(coarse_adj, size=self.num_clusters**2)
         c_edges = coarse_adj[c_senders, c_receivers][:, jnp.newaxis]
         

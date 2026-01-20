@@ -4,7 +4,12 @@ import numpy as np
 from flax.training import train_state
 import optax
 from .models import MSVIB
-from .metrics import information_bottleneck_loss, effective_information
+from .metrics import (
+    information_bottleneck_loss, 
+    effective_information, 
+    estimate_transition_matrix, 
+    causal_emergence_loss
+)
 import jraph
 
 class ARCE:
@@ -17,6 +22,8 @@ class ARCE:
         )
         self.params = None
         self.state = None
+        # Pre-calculated Micro-EI for Ising Model (approximate baseline)
+        self.micro_ei_baseline = 0.5 
 
     def init_model(self, rng, sample_graph):
         variables = self.model.init(rng, sample_graph)
@@ -106,17 +113,30 @@ class ARCE:
 
     def train_step(self, state, batch_graphs, targets, rng):
         # We define a pure function for JIT
-        def loss_fn(params, graphs, y, r):
+        def loss_fn(params, graphs, y, r, micro_ei):
             mu, logvar, pred_y, _, _ = self.model.apply(
                 {'params': params}, 
                 graphs,
                 rngs={'vmap_rng': r}
             )
-            return information_bottleneck_loss(mu, logvar, pred_y, y)
+            
+            # 1. Standard VIB Loss (Compression + Prediction)
+            # Use only the last prediction of the sequence for the target
+            vib_loss = information_bottleneck_loss(mu[-1:], logvar[-1:], pred_y[-1:], y)
+            
+            # 2. Causal Emergence Loss
+            # Estimate Macro-EI from the latent sequence (mu)
+            t_matrix = estimate_transition_matrix(mu)
+            macro_ei = effective_information(t_matrix)
+            ce_loss = causal_emergence_loss(micro_ei, macro_ei)
+            
+            # Combined Loss (gamma controls the push for emergence)
+            gamma = self.config.get('gamma', 0.1)
+            return vib_loss + gamma * ce_loss
 
         @jax.jit
-        def _step(st, g, t, r):
-            grads = jax.grad(loss_fn)(st.params, g, t, r)
+        def _step(st, g, t, r, mei):
+            grads = jax.grad(loss_fn)(st.params, g, t, r, mei)
             return st.apply_gradients(grads=grads)
             
-        return _step(state, batch_graphs, targets, rng)
+        return _step(state, batch_graphs, targets, rng, self.micro_ei_baseline)
