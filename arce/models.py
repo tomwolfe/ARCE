@@ -115,7 +115,9 @@ class IterativeDecimator(nn.Module):
             
             # Reconstruct sparse senders/receivers from top_k
             batch_offset = jnp.arange(num_graphs)[:, None, None] * self.num_clusters
-            c_senders = (jnp.arange(self.num_clusters)[None, :, None] + batch_offset).reshape(-1)
+            # Properly broadcast senders to match top_k receivers
+            senders_base = jnp.arange(self.num_clusters)[None, :, None]
+            c_senders = (jnp.broadcast_to(senders_base, top_k_idx.shape) + batch_offset).reshape(-1)
             c_receivers = (top_k_idx + batch_offset).reshape(-1)
             c_edge_weights = top_k_val.reshape(-1, 1)
             n_edge_per_graph = self.num_clusters * self.top_k_edges

@@ -10,7 +10,6 @@ def train_arce(engine, num_epochs=20):
     rng = jax.random.PRNGKey(42)
     
     # Generate training data: configurations at various temperatures
-    # We use sequences to allow for Causal Emergence estimation
     train_sequences = []
     targets = []
     
@@ -28,12 +27,14 @@ def train_arce(engine, num_epochs=20):
                 spins = generate_ising_2d(L=8, T=T, steps=20, key=subkey)
                 
             train_sequences.append(seq)
-            # Target for the LAST state in sequence is its magnetization 
-            # (or we could predict next magnetization for each step)
             targets.append(jnp.abs(jnp.mean(spins)))
             
     targets = jnp.array(targets).reshape(-1, 1)
     
+    # Metrics for plotting
+    mi_list = []
+    task_loss_list = []
+
     # Training Loop
     for epoch in range(num_epochs):
         epoch_loss = 0
@@ -42,24 +43,21 @@ def train_arce(engine, num_epochs=20):
             batch_graph = jraph.batch(train_sequences[i])
             rng, step_rng = jax.random.split(rng)
             # UNSUPERVISED: We pass None for targets to encourage discovery
-            engine.state = engine.train_step(
+            engine.state, aux = engine.train_step(
                 engine.state, 
                 batch_graph, 
                 None, 
                 step_rng
             )
             
+            if epoch == num_epochs - 1:
+                mi_list.append(float(aux['mi']))
+                task_loss_list.append(float(aux['task']))
+
         if epoch % 5 == 0:
-            # Quick loss check on first sample
-            first_seq_batch = jraph.batch(train_sequences[0])
-            model_params = {k: v for k, v in engine.state.params.items() if k not in ['loss_logvars', 'symbolic_coeffs']}
-            mu, logvar, pred_y, _, _, _, _, _ = engine.model.apply(
-                {'params': model_params}, 
-                first_seq_batch,
-                training=False,
-                rngs={'vmap_rng': jax.random.PRNGKey(0)}
-            )
-            print(f"Epoch {epoch} | Latent Mean (first sample): {float(mu.mean()):.4f}")
+            print(f"Epoch {epoch} | Loss: {float(aux['total']):.4f} | CE: {float(aux['ce']):.4f} | Recon: {float(aux['recon']):.4f}")
+
+    return mi_list, task_loss_list
 
 def main():
     print("--- ARCE: Automated Renormalization & Coarse-Graining Engine ---")
@@ -88,7 +86,7 @@ def main():
     print("Engine Initialized.")
     
     # 3. Functional Training
-    train_arce(engine)
+    mi_data, task_data = train_arce(engine)
     
     # 4. Demonstration: Coarsening
     print("\n--- Demonstration: Coarsening ---")
@@ -106,7 +104,6 @@ def main():
 
     # 5. Symbolic Discovery
     print("\n--- Demonstration: Symbolic Discovery ---")
-    # Address "Small Sample Size" critique: use 50 steps instead of 10
     history = []
     rng, subkey = jax.random.split(rng)
     curr_spins = generate_ising_2d(L=10, T=2.26, steps=500, key=subkey)
@@ -118,16 +115,18 @@ def main():
     equation = engine.discover_dynamics(history)
     print(f"Discovered Equation: {equation}")
 
-    # 5. Probabilistic Manifold Mapping
+    # 6. Probabilistic Manifold Mapping
     _, last_mu = engine.coarsen(history[-1])
     prediction = engine.predict_manifold(last_mu, horizon=5)
     print(f"Predicted Final State Mean: {prediction['mean'].mean():.4f}")
 
-    # 6. Information Trade-off Visualization (Mock data for demo)
-    betas = [1e-4, 1e-3, 1e-2, 0.1, 0.5]
-    info_loss = [0.1, 0.5, 1.2, 2.5, 4.0]
-    predictive_power = [0.95, 0.92, 0.85, 0.70, 0.50]
-    plot_information_tradeoff(betas, info_loss, predictive_power)
+    # 7. Information Trade-off Visualization (Real data from training)
+    sort_idx = np.argsort(mi_data)
+    plot_information_tradeoff(
+        np.array(mi_data)[sort_idx], 
+        np.array(mi_data)[sort_idx], 
+        1.0 - np.array(task_data)[sort_idx]
+    )
     print("Visualization saved to info_tradeoff.png")
 
 if __name__ == "__main__":

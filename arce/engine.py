@@ -30,7 +30,8 @@ class ARCE:
         self.lambda_sparse = config.get('lambda_sparse', 0.01)
         self.basis_library = BasisLibrary(
             include_transcendental=config.get('include_transcendental', True),
-            include_quadratic=config.get('include_quadratic', True)
+            include_quadratic=config.get('include_quadratic', True),
+            include_power_laws=True
         )
 
     def init_model(self, rng, sample_graph):
@@ -44,12 +45,12 @@ class ARCE:
             'continuity': jnp.zeros(()),
             'sparsity': jnp.zeros(()),
             'symbolic': jnp.zeros(()),
-            'reconstruction': jnp.zeros(()),
+            'reconstruction': jnp.array(-1.0), # Higher initial weight for grounding
             'predictive': jnp.zeros(()),
             'topo_sparsity': jnp.zeros(())
         }
 
-        # Initialize global symbolic coefficients (Recommendation 1)
+        # Initialize global symbolic coefficients
         d = self.config.get('latent_dim', 16)
         n_basis = len(self.basis_library.get_names(d))
         params['symbolic_coeffs'] = jnp.zeros((n_basis, d))
@@ -86,36 +87,8 @@ class ARCE:
         )
         return coarse_graph, mu
 
-    @staticmethod
-    def _lasso_ista_jax(X_mat, y_mat, alpha=0.01, num_iters=100, initial_w=None):
-        """
-        Pure JAX ISTA for differentiable symbolic discovery.
-        Uses jax.lax.scan to allow gradients to flow through iterations.
-        """
-        def soft_threshold(x, thresh):
-            return jnp.sign(x) * jnp.maximum(jnp.abs(x) - thresh, 0)
-
-        n_feat = X_mat.shape[1]
-        n_target = y_mat.shape[1]
-        
-        spectral_norm_sq = jnp.linalg.norm(X_mat, ord=2)**2
-        step = 0.5 / (spectral_norm_sq + 1e-5)
-        
-        if initial_w is None:
-            initial_w = jnp.zeros((n_feat, n_target))
-
-        def scan_body(w, _):
-            grad = X_mat.T @ (X_mat @ w - y_mat)
-            next_w = soft_threshold(w - step * grad, alpha * step)
-            return next_w, None
-
-        w_final, _ = jax.lax.scan(scan_body, initial_w, jnp.arange(num_iters))
-        return w_final
-
     def discover_dynamics(self, time_series_graphs):
-        """
-        Identifies sparse dynamics in the coarse-grained latent space.
-        """
+        """Identifies sparse dynamics in the coarse-grained latent space."""
         print("ARCE: Identifying Sufficient Statistics...")
         
         # 1. Extract macro-states over time
@@ -142,19 +115,13 @@ class ARCE:
         return " | ".join(equations)
 
     def predict_manifold(self, state_mu, horizon=10):
-        """
-        Returns probabilistic future state distribution.
-        """
+        """Returns probabilistic future state distribution."""
         print(f"ARCE: Predicting manifold over horizon {horizon}...")
-        
         current_state = state_mu
         path = [current_state]
-        
         for _ in range(horizon):
-            # For demo, simple drift
             current_state = current_state * 0.95 + 0.01 
             path.append(current_state)
-            
         return {
             "mean": current_state,
             "path": jnp.concatenate(path, axis=0),
@@ -162,9 +129,7 @@ class ARCE:
         }
 
     def train_step(self, state, batch_graphs, targets, rng):
-        # We define a pure function for JIT
         def loss_fn(params, graphs, y, r, micro_ei):
-            # Extract logvars for dynamic weighting
             logvars = params['loss_logvars']
             global_coeffs = params['symbolic_coeffs']
             model_params = {k: v for k, v in params.items() if k not in ['loss_logvars', 'symbolic_coeffs']}
@@ -177,13 +142,8 @@ class ARCE:
                 rngs={'vmap_rng': r1, 'gumbel': r2}
             )
             
-            # 1. Causal Emergence Loss (Robust) with MI constraint
-            macro_ei = effective_information_robust(
-                mu, 
-                use_gaussian=self.config.get('use_gaussian_ei', False)
-            )
+            macro_ei = effective_information_robust(mu, use_gaussian=self.config.get('use_gaussian_ei', False))
             
-            # Approximate MI between micro and macro (I(X;M) = H(M) - H(M|X))
             h_m_given_x = 0.5 * jnp.sum(logvar + jnp.log(2 * jnp.pi * jnp.e), axis=-1).mean()
             cov_mu = jnp.cov(mu, rowvar=False)
             _, logdet_cov = jnp.linalg.slogdet(cov_mu + 1e-6 * jnp.eye(mu.shape[1]))
@@ -192,18 +152,10 @@ class ARCE:
             
             ce_loss = causal_emergence_loss(micro_ei, macro_ei, mi_micro_macro, target_mi=self.config.get('target_mi', 1.0))
             
-            # 2. Dynamics Consistency (Self-Supervised)
             z_t = mu[:-1]
             z_next = mu[1:]
-            def huber_loss(x, delta=1.0):
-                abs_x = jnp.abs(x)
-                quadratic = jnp.minimum(abs_x, delta)
-                linear = abs_x - quadratic
-                return 0.5 * jnp.square(quadratic) + delta * linear
+            continuity_loss = jnp.mean(jnp.square(z_next - z_t))
             
-            continuity_loss = jnp.mean(huber_loss(z_next - z_t))
-            
-            # 3. Task Loss
             is_unsupervised = (y.shape[0] == 0)
             def supervised_loss():
                 return information_bottleneck_loss(mu[-1:], logvar[-1:], pred_y[-1:], y)
@@ -211,28 +163,13 @@ class ARCE:
                 return 0.1 * jnp.mean(kl_divergence(mu, logvar))
             task_loss = jax.lax.cond(is_unsupervised, unsupervised_loss, supervised_loss)
             
-            # 4. Sparsity Regularization
-            delta_mu = mu[1:] - mu[:-1]
-            sparsity_loss = jnp.mean(jnp.abs(delta_mu))
-
-            # 5. Symbolic Discovery Feedback (End-to-End)
+            sparsity_loss = jnp.mean(jnp.abs(mu[1:] - mu[:-1]))
             X_poly = self.basis_library.get_features(z_t)
-            y_dot = z_next - z_t
-            
-            # Symbolic residual loss to couple SGD with the dynamics
-            symbolic_residual = y_dot - X_poly @ global_coeffs
-            symbolic_loss = jnp.mean(jnp.square(symbolic_residual))
-
-            # 6. Reconstruction Loss (VAE term)
+            symbolic_loss = jnp.mean(jnp.square((z_next - z_t) - X_poly @ global_coeffs))
             reconstruction_loss = jnp.mean(jnp.square(recon_micro - h_micro))
-            
-            # 7. Topological Sparsity
             topo_sparsity_loss = sum(jnp.mean(jnp.abs(adj)) for adj in all_coarse_adjs)
-
-            # 8. Symbolic Sparsity (L1 on coefficients)
             symbolic_sparsity_loss = jnp.mean(jnp.abs(global_coeffs))
 
-            # Dynamic Multi-Task Weighting
             def weighted_loss(L, logv):
                 return jnp.exp(-logv) * L + logv
                 
@@ -242,17 +179,26 @@ class ARCE:
                 weighted_loss(continuity_loss, logvars['continuity']) +
                 weighted_loss(sparsity_loss, logvars['sparsity']) +
                 weighted_loss(symbolic_loss, logvars['symbolic']) +
-                weighted_loss(reconstruction_loss, logvars['reconstruction']) * 0.1 +
+                weighted_loss(reconstruction_loss, logvars['reconstruction']) +
                 weighted_loss(topo_sparsity_loss, logvars['topo_sparsity']) +
                 weighted_loss(symbolic_sparsity_loss, logvars['sparsity']) 
             )
             
-            return total_loss
+            return total_loss, {
+                'total': total_loss,
+                'ce': ce_loss,
+                'task': task_loss,
+                'recon': reconstruction_loss,
+                'symbolic': symbolic_loss,
+                'mi': mi_micro_macro
+            }
 
         @jax.jit
         def _step(st, g, t, r, mei):
-            grads = jax.grad(loss_fn)(st.params, g, t, r, mei)
-            return st.apply_gradients(grads=grads)
+            grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+            (loss, aux), grads = grad_fn(st.params, g, t, r, mei)
+            new_st = st.apply_gradients(grads=grads)
+            return new_st, aux
             
         t_input = targets if targets is not None else jnp.zeros((0, 1))
         return _step(state, batch_graphs, t_input, rng, self.micro_ei_baseline)

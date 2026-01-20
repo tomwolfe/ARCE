@@ -119,9 +119,10 @@ def suggest_num_clusters(eigs, threshold=0.1):
 
 class BasisLibrary:
     """Configurable basis library for Symbolic Discovery."""
-    def __init__(self, include_transcendental=True, include_quadratic=True):
+    def __init__(self, include_transcendental=True, include_quadratic=True, include_power_laws=True):
         self.include_transcendental = include_transcendental
         self.include_quadratic = include_quadratic
+        self.include_power_laws = include_power_laws
 
     def get_features(self, data):
         """Pure JAX version of basis library for JIT compatibility."""
@@ -138,7 +139,15 @@ class BasisLibrary:
         if self.include_transcendental:
             feats.append(jnp.sin(data))
             feats.append(jnp.cos(data))
-            feats.append(jnp.exp(-jnp.square(data)))
+            # Safe exp to avoid NaNs
+            feats.append(jnp.exp(-jnp.clip(jnp.square(data), 0, 10)))
+            
+        if self.include_power_laws:
+            # Common power laws in RG: x^3, sqrt(|x|), etc.
+            feats.append(jnp.sign(data) * jnp.power(jnp.abs(data) + 1e-6, 1.5))
+            feats.append(jnp.sign(data) * jnp.power(jnp.abs(data) + 1e-6, 3.0))
+            # Critical exponent style: |x - x_c|^beta (here x_c=0 for simplicity)
+            feats.append(jnp.power(jnp.abs(data) + 1e-6, 0.125)) # Ising beta = 1/8
             
         return jnp.concatenate(feats, axis=-1)
 
@@ -151,7 +160,11 @@ class BasisLibrary:
         if self.include_transcendental:
             names += [f"sin(M{i})" for i in range(d)]
             names += [f"cos(M{i})" for i in range(d)]
-            names += [f"exp(-M{i}^2)" for i in range(d)]
+            names += [f"gauss(M{i})" for i in range(d)]
+        if self.include_power_laws:
+            names += [f"M{i}^1.5" for i in range(d)]
+            names += [f"M{i}^3" for i in range(d)]
+            names += [f"M{i}^0.125" for i in range(d)]
         return names
 
 def plot_information_tradeoff(betas, info_loss, predictive_power):

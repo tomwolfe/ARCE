@@ -1,0 +1,104 @@
+    def train_step(self, state, batch_graphs, targets, rng):
+        # We define a pure function for JIT
+        def loss_fn(params, graphs, y, r, micro_ei):
+            # Extract logvars for dynamic weighting
+            logvars = params['loss_logvars']
+            global_coeffs = params['symbolic_coeffs']
+            model_params = {k: v for k, v in params.items() if k not in ['loss_logvars', 'symbolic_coeffs']}
+            
+            r1, r2 = jax.random.split(r)
+            mu, logvar, pred_y, _, _, recon_micro, h_micro, all_coarse_adjs = self.model.apply(
+                {'params': model_params}, 
+                graphs,
+                training=True,
+                rngs={'vmap_rng': r1, 'gumbel': r2}
+            )
+            
+            # 1. Causal Emergence Loss (Robust) with MI constraint
+            macro_ei = effective_information_robust(
+                mu, 
+                use_gaussian=self.config.get('use_gaussian_ei', False)
+            )
+            
+            # Approximate MI between micro and macro (I(X;M) = H(M) - H(M|X))
+            h_m_given_x = 0.5 * jnp.sum(logvar + jnp.log(2 * jnp.pi * jnp.e), axis=-1).mean()
+            cov_mu = jnp.cov(mu, rowvar=False)
+            _, logdet_cov = jnp.linalg.slogdet(cov_mu + 1e-6 * jnp.eye(mu.shape[1]))
+            h_m = 0.5 * (mu.shape[1] * jnp.log(2 * jnp.pi * jnp.e) + logdet_cov)
+            mi_micro_macro = h_m - h_m_given_x
+            
+            ce_loss = causal_emergence_loss(micro_ei, macro_ei, mi_micro_macro, target_mi=self.config.get('target_mi', 1.0))
+            
+            # 2. Dynamics Consistency (Self-Supervised)
+            z_t = mu[:-1]
+            z_next = mu[1:]
+            def huber_loss(x, delta=1.0):
+                abs_x = jnp.abs(x)
+                quadratic = jnp.minimum(abs_x, delta)
+                linear = abs_x - quadratic
+                return 0.5 * jnp.square(quadratic) + delta * linear
+            
+            continuity_loss = jnp.mean(huber_loss(z_next - z_t))
+            
+            # 3. Task Loss
+            is_unsupervised = (y.shape[0] == 0)
+            def supervised_loss():
+                return information_bottleneck_loss(mu[-1:], logvar[-1:], pred_y[-1:], y)
+            def unsupervised_loss():
+                return 0.1 * jnp.mean(kl_divergence(mu, logvar))
+            task_loss = jax.lax.cond(is_unsupervised, unsupervised_loss, supervised_loss)
+            
+            # 4. Sparsity Regularization
+            delta_mu = mu[1:] - mu[:-1]
+            sparsity_loss = jnp.mean(jnp.abs(delta_mu))
+
+            # 5. Symbolic Discovery Feedback (End-to-End)
+            X_poly = self.basis_library.get_features(z_t)
+            y_dot = z_next - z_t
+            
+            # Symbolic residual loss to couple SGD with the dynamics
+            symbolic_residual = y_dot - X_poly @ global_coeffs
+            symbolic_loss = jnp.mean(jnp.square(symbolic_residual))
+
+            # 6. Reconstruction Loss (VAE term)
+            reconstruction_loss = jnp.mean(jnp.square(recon_micro - h_micro))
+            
+            # 7. Topological Sparsity
+            topo_sparsity_loss = sum(jnp.mean(jnp.abs(adj)) for adj in all_coarse_adjs)
+
+            # 8. Symbolic Sparsity (L1 on coefficients)
+            symbolic_sparsity_loss = jnp.mean(jnp.abs(global_coeffs))
+
+            # Dynamic Multi-Task Weighting
+            def weighted_loss(L, logv):
+                return jnp.exp(-logv) * L + logv
+                
+            total_loss = (
+                weighted_loss(task_loss, logvars['task']) +
+                weighted_loss(ce_loss, logvars['ce']) +
+                weighted_loss(continuity_loss, logvars['continuity']) +
+                weighted_loss(sparsity_loss, logvars['sparsity']) +
+                weighted_loss(symbolic_loss, logvars['symbolic']) +
+                weighted_loss(reconstruction_loss, logvars['reconstruction']) +
+                weighted_loss(topo_sparsity_loss, logvars['topo_sparsity']) +
+                weighted_loss(symbolic_sparsity_loss, logvars['sparsity']) 
+            )
+            
+            return total_loss, {
+                'total': total_loss,
+                'ce': ce_loss,
+                'task': task_loss,
+                'recon': reconstruction_loss,
+                'symbolic': symbolic_loss,
+                'mi': mi_micro_macro
+            }
+
+        @jax.jit
+        def _step(st, g, t, r, mei):
+            grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+            (loss, aux), grads = grad_fn(st.params, g, t, r, mei)
+            new_st = st.apply_gradients(grads=grads)
+            return new_st, aux
+            
+        t_input = targets if targets is not None else jnp.zeros((0, 1))
+        return _step(state, batch_graphs, t_input, rng, self.micro_ei_baseline)
