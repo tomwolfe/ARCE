@@ -38,6 +38,7 @@ class IterativeDecimator(nn.Module):
     Enhanced to handle batched GraphsTuple.
     """
     num_clusters: int
+    top_k_edges: Optional[int] = None # If set, keeps only top K edges per cluster
 
     @nn.compact
     def __call__(self, graph: jraph.GraphsTuple) -> Tuple[jraph.GraphsTuple, jnp.ndarray]:
@@ -105,19 +106,37 @@ class IterativeDecimator(nn.Module):
         # Transpose to [num_graphs, num_clusters, num_clusters]
         coarse_adj_dense = jnp.transpose(coarse_adj_dense, (1, 0, 2))
         
-        # Convert dense coarse adjacency back to sparse (FC-like but with weights)
-        # To maintain fixed shapes for JIT, we keep all clusters connected but use the weights
-        single_fc_senders, single_fc_receivers = jnp.nonzero(
-            jnp.ones((self.num_clusters, self.num_clusters)), 
-            size=self.num_clusters**2
-        )
-        
-        batch_offset = jnp.arange(num_graphs)[:, None] * self.num_clusters
-        c_senders = (single_fc_senders[None, :] + batch_offset).reshape(-1)
-        c_receivers = (single_fc_receivers[None, :] + batch_offset).reshape(-1)
-        
-        # Weights for these edges
-        c_edge_weights = coarse_adj_dense[:, single_fc_senders, single_fc_receivers].reshape(-1, 1)
+        # 4. Convert dense coarse adjacency back to sparse
+        if self.top_k_edges is not None:
+            # For each cluster, keep only top_k outgoing edges
+            k = min(self.top_k_edges, self.num_clusters)
+            top_vals, top_indices = jax.lax.top_k(coarse_adj_dense, k)
+            
+            # Reconstruct sparse representation
+            single_fc_senders = jnp.repeat(jnp.arange(self.num_clusters), k)
+            single_fc_receivers = top_indices.reshape(num_graphs, -1)
+            
+            batch_offset = jnp.arange(num_graphs)[:, None] * self.num_clusters
+            c_senders = (single_fc_senders[None, :] + batch_offset).reshape(-1)
+            # Use advanced indexing to get receivers correctly for the batch
+            c_receivers = (single_fc_receivers + batch_offset).reshape(-1)
+            
+            c_edge_weights = top_vals.reshape(-1, 1)
+            n_edge_per_graph = self.num_clusters * k
+        else:
+            # Full connectivity (FC)
+            single_fc_senders, single_fc_receivers = jnp.nonzero(
+                jnp.ones((self.num_clusters, self.num_clusters)), 
+                size=self.num_clusters**2
+            )
+            
+            batch_offset = jnp.arange(num_graphs)[:, None] * self.num_clusters
+            c_senders = (single_fc_senders[None, :] + batch_offset).reshape(-1)
+            c_receivers = (single_fc_receivers[None, :] + batch_offset).reshape(-1)
+            
+            # Weights for these edges
+            c_edge_weights = coarse_adj_dense[:, single_fc_senders, single_fc_receivers].reshape(-1, 1)
+            n_edge_per_graph = self.num_clusters**2
         
         c_n_node = jnp.full((num_graphs,), self.num_clusters)
         
@@ -127,7 +146,7 @@ class IterativeDecimator(nn.Module):
             senders=c_senders,
             receivers=c_receivers,
             edges=c_edge_weights,
-            n_edge=jnp.full((num_graphs,), self.num_clusters**2)
+            n_edge=jnp.full((num_graphs,), n_edge_per_graph)
         )
         
         return coarse_graph, assignments
@@ -138,6 +157,7 @@ class MSVIB(nn.Module):
     latent_dim: int
     num_clusters_list: Iterable[int] # e.g., [16, 4] for multi-step
     output_dim: int = 1
+    top_k_edges: Optional[int] = None
 
     def setup(self):
         # Initial encoder for micro-states
@@ -147,7 +167,7 @@ class MSVIB(nn.Module):
         
         # Create multiple decimators and refinement encoders for multi-step renormalization
         self.decimators = [
-            IterativeDecimator(num_clusters=nc) for nc in self.num_clusters_list
+            IterativeDecimator(num_clusters=nc, top_k_edges=self.top_k_edges) for nc in self.num_clusters_list
         ]
         
         # Encoders to refine features after each decimation

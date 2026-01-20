@@ -65,7 +65,9 @@ def main():
         'encoder_features': [16, 8], # Smaller networks for demo
         'latent_dim': 2,
         'num_clusters_list': [8, 4], # Hierarchical pooling: 64 -> 8 -> 4 nodes
-        'lr': 1e-3
+        'lr': 1e-3,
+        'top_k_edges': 3,            # Sparse coarsening: keep top 3 edges per cluster
+        'use_gaussian_ei': False     # Use robust non-parametric EI
     }
     
     # 2. Initialize Engine

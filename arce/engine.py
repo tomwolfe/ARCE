@@ -6,7 +6,7 @@ import optax
 from .models import MSVIB
 from .metrics import (
     information_bottleneck_loss, 
-    effective_information_gaussian, 
+    effective_information_robust, 
     estimate_transition_matrix, 
     causal_emergence_loss,
     kl_divergence
@@ -19,7 +19,8 @@ class ARCE:
         self.model = MSVIB(
             encoder_features=config.get('encoder_features', [64, 64]),
             latent_dim=config.get('latent_dim', 16),
-            num_clusters_list=config.get('num_clusters_list', [4])
+            num_clusters_list=config.get('num_clusters_list', [4]),
+            top_k_edges=config.get('top_k_edges', None)
         )
         self.params = None
         self.state = None
@@ -67,16 +68,22 @@ class ARCE:
         X = macro_states[:-1]
         y = macro_states[1:] - macro_states[:-1]
         
-        # 3. JAX-native Polynomial Features (Degree 2)
-        def get_poly_features(data):
+        # 3. JAX-native Polynomial & Transcendental Features
+        def get_basis_features(data):
             n, d = data.shape
+            # Linear and Bias
             feats = [jnp.ones((n, 1)), data]
+            # Quadratic
             for i in range(d):
                 for j in range(i, d):
                     feats.append((data[:, i] * data[:, j])[:, None])
+            # Transcendental (expanded basis)
+            feats.append(jnp.sin(data))
+            feats.append(jnp.cos(data))
+            feats.append(jnp.exp(-jnp.square(data))) # Gaussian kernels
             return jnp.concatenate(feats, axis=-1)
             
-        X_poly = get_poly_features(X)
+        X_poly = get_basis_features(X)
         
         # Feature names for reconstruction
         d = X.shape[1]
@@ -84,6 +91,9 @@ class ARCE:
         for i in range(d):
             for j in range(i, d):
                 names.append(f"M{i}*M{j}")
+        names += [f"sin(M{i})" for i in range(d)]
+        names += [f"cos(M{i})" for i in range(d)]
+        names += [f"exp(-M{i}^2)" for i in range(d)]
 
         # 4. JAX-native Sparse Regression (ISTA)
         def soft_threshold(x, thresh):
@@ -142,14 +152,24 @@ class ARCE:
                 rngs={'vmap_rng': r}
             )
             
-            # 1. Causal Emergence Loss (Joint Gaussian)
-            macro_ei = effective_information_gaussian(mu)
+            # 1. Causal Emergence Loss (Robust)
+            macro_ei = effective_information_robust(
+                mu, 
+                use_gaussian=self.config.get('use_gaussian_ei', False)
+            )
             ce_loss = causal_emergence_loss(micro_ei, macro_ei)
             
             # 2. Dynamics Consistency (Self-Supervised)
             z_t = mu[:-1]
             z_next = mu[1:]
-            continuity_loss = jnp.mean(jnp.square(z_next - z_t))
+            # Use Huber loss (delta=1.0) to be robust to valid but sharp transitions
+            def huber_loss(x, delta=1.0):
+                abs_x = jnp.abs(x)
+                quadratic = jnp.minimum(abs_x, delta)
+                linear = abs_x - quadratic
+                return 0.5 * jnp.square(quadratic) + delta * linear
+            
+            continuity_loss = jnp.mean(huber_loss(z_next - z_t))
             
             # 3. Task Loss
             # We use the presence of targets to decide between supervised and unsupervised

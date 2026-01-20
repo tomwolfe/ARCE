@@ -55,6 +55,18 @@ def effective_information_gaussian(latent_series):
     mi = 0.5 * (logdet_t + logdet_next - logdet_joint)
     return jnp.maximum(mi, 0.0)
 
+def effective_information_robust(latent_series, num_bins=16, use_gaussian=False):
+    """
+    Robust EI estimator that selects between Gaussian and Non-parametric (binning).
+    Non-parametric version is better for phase transitions (e.g. Ising at Tc).
+    """
+    if use_gaussian:
+        return effective_information_gaussian(latent_series)
+    
+    # Non-parametric EI via transition matrix estimation
+    trans_matrix = estimate_transition_matrix(latent_series, num_bins=num_bins)
+    return effective_information(trans_matrix)
+
 def soft_histogram2d(x, y, bins=10, bandwidth=0.1, adaptive_range=True):
     """
     Differentiable 2D histogram with optional adaptive range.

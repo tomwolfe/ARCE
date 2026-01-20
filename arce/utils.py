@@ -39,9 +39,15 @@ def ising_to_jraph(spins):
             # Right
             senders.append(curr)
             receivers.append(i * L + (j + 1) % L)
+            # Left
+            senders.append(curr)
+            receivers.append(i * L + (j - 1 + L) % L)
             # Down
             senders.append(curr)
             receivers.append(((i + 1) % L) * L + j)
+            # Up
+            senders.append(curr)
+            receivers.append(((i - 1 + L) % L) * L + j)
             
     return jraph.GraphsTuple(
         nodes=jnp.array(nodes),
